@@ -16,17 +16,29 @@ people usually want:
 
 No third-party dependencies — Python 3.9+ stdlib only.
 
+### Single-file (no install)
+
+The whole tool is also packaged as a single self-contained script
+[`logs_to_cookie.py`](./logs_to_cookie.py). Just download that one file
+and run it:
+
+```bash
+curl -sLO https://raw.githubusercontent.com/zyblahblah/logs-to-cookie/main/logs_to_cookie.py
+python logs_to_cookie.py --help
+```
+
+### As a package
+
 ```bash
 git clone https://github.com/zyblahblah/logs-to-cookie.git
 cd logs-to-cookie
-pip install -e .
-```
-
-Or run directly without installing:
-
-```bash
+pip install -e .          # installs the `logs-to-cookie` console script
+# or
 python -m logs_to_cookie --help
 ```
+
+> All examples below use `python -m logs_to_cookie`. The single-file form is
+> identical — just replace it with `python logs_to_cookie.py`.
 
 ## Commands
 
