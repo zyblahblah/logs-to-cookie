@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Tuple, Union
 
 from .cookies import NETSCAPE_HEADER, collect_cookies, to_netscape_line
 from .ulp import collect_credentials
@@ -14,8 +14,14 @@ def _safe_keyword(k: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in k.strip()) or "kw"
 
 
+def _as_roots(roots: Union[Path, Iterable[Path]]) -> list:
+    if isinstance(roots, Path):
+        return [roots]
+    return list(roots)
+
+
 def sort_logs(
-    root: Path,
+    root: Union[Path, Iterable[Path]],
     out_dir: Path,
     keywords: Iterable[str],
 ) -> Dict[str, Tuple[int, int]]:
@@ -45,30 +51,33 @@ def sort_logs(
             )
             cookie_handles[k].write(NETSCAPE_HEADER)
 
-        for url, user, pwd, _src in collect_credentials(root):
-            host = domain_of(url)
-            haystack = (url + " " + host).lower()
-            line = f"{url}:{user}:{pwd}"
-            for k in kws:
-                if k.lower() in haystack:
-                    if line in seen_ulp[k]:
-                        continue
-                    seen_ulp[k].add(line)
-                    ulp_handles[k].write(line + "\n")
-                    counts[k][0] += 1
+        roots = _as_roots(root)
+        for r in roots:
+            for url, user, pwd, _src in collect_credentials(r):
+                host = domain_of(url)
+                haystack = (url + " " + host).lower()
+                line = f"{url}:{user}:{pwd}"
+                for k in kws:
+                    if k.lower() in haystack:
+                        if line in seen_ulp[k]:
+                            continue
+                        seen_ulp[k].add(line)
+                        ulp_handles[k].write(line + "\n")
+                        counts[k][0] += 1
 
-        for cookie in collect_cookies(root):
-            domain = (cookie.get("domain") or "").lower()
-            if not domain:
-                continue
-            line = to_netscape_line(cookie)
-            for k in kws:
-                if k.lower() in domain:
-                    if line in seen_cookie[k]:
-                        continue
-                    seen_cookie[k].add(line)
-                    cookie_handles[k].write(line + "\n")
-                    counts[k][1] += 1
+        for r in roots:
+            for cookie in collect_cookies(r):
+                domain = (cookie.get("domain") or "").lower()
+                if not domain:
+                    continue
+                line = to_netscape_line(cookie)
+                for k in kws:
+                    if k.lower() in domain:
+                        if line in seen_cookie[k]:
+                            continue
+                        seen_cookie[k].add(line)
+                        cookie_handles[k].write(line + "\n")
+                        counts[k][1] += 1
     finally:
         for f in ulp_handles.values():
             f.close()

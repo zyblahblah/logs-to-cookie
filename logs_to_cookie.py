@@ -16,14 +16,20 @@ Stdlib only, Python 3.9+.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -297,6 +303,157 @@ def dedupe_cookies(cookies: Iterable[Dict]) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Archive extraction (password-protected logs)
+# ---------------------------------------------------------------------------
+
+ARCHIVE_EXTS = {".zip", ".rar", ".7z"}
+
+
+def is_archive(path: Path) -> bool:
+    return path.suffix.lower() in ARCHIVE_EXTS
+
+
+def _have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _seven_zip_binary() -> Optional[str]:
+    for cand in ("7z", "7za", "7zz"):
+        if _have(cand):
+            return cand
+    return None
+
+
+def _try_zip(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
+    try:
+        zf = zipfile.ZipFile(archive)
+    except (zipfile.BadZipFile, OSError):
+        return False
+    try:
+        for pwd in passwords:
+            pwd_b = pwd.encode("utf-8") if pwd else None
+            try:
+                zf.extractall(dest, pwd=pwd_b)
+                return True
+            except RuntimeError:
+                continue
+            except zipfile.BadZipFile:
+                return False
+    finally:
+        zf.close()
+    return False
+
+
+def _try_7z(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
+    binary = _seven_zip_binary()
+    if not binary:
+        return False
+    for pwd in passwords:
+        cmd = [binary, "x", "-y", f"-o{dest}"]
+        cmd.append(f"-p{pwd}" if pwd is not None else "-p")
+        cmd.append(str(archive))
+        try:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=600,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _try_unrar(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
+    if not _have("unrar"):
+        return False
+    for pwd in passwords:
+        cmd = ["unrar", "x", "-y", "-inul"]
+        cmd.append(f"-p{pwd}" if pwd is not None else "-p-")
+        cmd.append(str(archive))
+        cmd.append(str(dest) + os.sep)
+        try:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=600,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def extract_archive(
+    archive: Path, dest: Path, passwords: List[Optional[str]]
+) -> bool:
+    dest.mkdir(parents=True, exist_ok=True)
+    ext = archive.suffix.lower()
+    if ext == ".zip":
+        if _try_zip(archive, dest, passwords):
+            return True
+        return _try_7z(archive, dest, passwords)
+    if ext == ".rar":
+        if _try_unrar(archive, dest, passwords):
+            return True
+        return _try_7z(archive, dest, passwords)
+    if ext == ".7z":
+        return _try_7z(archive, dest, passwords)
+    return False
+
+
+def expand_input(
+    inputs: Iterable[Path],
+    passwords: Iterable[str],
+    workdir: Path,
+    recurse: bool = True,
+) -> Tuple[List[Path], List[Path]]:
+    pwd_list: List[Optional[str]] = [None]
+    for p in passwords:
+        if p and p not in pwd_list:
+            pwd_list.append(p)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    roots: List[Path] = []
+    failures: List[Path] = []
+    queue: List[Path] = []
+    seen: set = set()
+
+    for inp in inputs:
+        inp = inp.resolve()
+        if inp.is_file() and is_archive(inp):
+            queue.append(inp)
+        else:
+            roots.append(inp)
+
+    counter = 0
+    while queue:
+        archive = queue.pop()
+        if archive in seen:
+            continue
+        seen.add(archive)
+        counter += 1
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in archive.stem)
+        target = workdir / f"x{counter:03d}_{safe or 'arch'}"
+        if extract_archive(archive, target, pwd_list):
+            roots.append(target)
+            if recurse:
+                for nested in target.rglob("*"):
+                    if nested.is_file() and is_archive(nested) and nested not in seen:
+                        queue.append(nested)
+        else:
+            failures.append(archive)
+
+    return roots, failures
+
+
+# ---------------------------------------------------------------------------
 # Sorter
 # ---------------------------------------------------------------------------
 
@@ -306,8 +463,12 @@ def _safe_keyword(k: str) -> str:
 
 
 def sort_logs(
-    root: Path, out_dir: Path, keywords: Iterable[str]
+    root, out_dir: Path, keywords: Iterable[str]
 ) -> Dict[str, Tuple[int, int]]:
+    if isinstance(root, Path):
+        roots = [root]
+    else:
+        roots = list(root)
     kws = [k.strip() for k in keywords if k and k.strip()]
     if not kws:
         return {}
@@ -328,30 +489,32 @@ def sort_logs(
             )
             cookie_handles[k].write(NETSCAPE_HEADER)
 
-        for url, user, pwd, _ in collect_credentials(root):
-            host = domain_of(url)
-            haystack = (url + " " + host).lower()
-            line = f"{url}:{user}:{pwd}"
-            for k in kws:
-                if k.lower() in haystack:
-                    if line in seen_ulp[k]:
-                        continue
-                    seen_ulp[k].add(line)
-                    ulp_handles[k].write(line + "\n")
-                    counts[k][0] += 1
+        for r in roots:
+            for url, user, pwd, _ in collect_credentials(r):
+                host = domain_of(url)
+                haystack = (url + " " + host).lower()
+                line = f"{url}:{user}:{pwd}"
+                for k in kws:
+                    if k.lower() in haystack:
+                        if line in seen_ulp[k]:
+                            continue
+                        seen_ulp[k].add(line)
+                        ulp_handles[k].write(line + "\n")
+                        counts[k][0] += 1
 
-        for cookie in collect_cookies(root):
-            domain = (cookie.get("domain") or "").lower()
-            if not domain:
-                continue
-            line = to_netscape_line(cookie)
-            for k in kws:
-                if k.lower() in domain:
-                    if line in seen_cookie[k]:
-                        continue
-                    seen_cookie[k].add(line)
-                    cookie_handles[k].write(line + "\n")
-                    counts[k][1] += 1
+        for r in roots:
+            for cookie in collect_cookies(r):
+                domain = (cookie.get("domain") or "").lower()
+                if not domain:
+                    continue
+                line = to_netscape_line(cookie)
+                for k in kws:
+                    if k.lower() in domain:
+                        if line in seen_cookie[k]:
+                            continue
+                        seen_cookie[k].add(line)
+                        cookie_handles[k].write(line + "\n")
+                        counts[k][1] += 1
     finally:
         for f in ulp_handles.values():
             f.close()
@@ -375,78 +538,140 @@ def _open_out(path: str):
     return open(p, "w", encoding="utf-8"), True
 
 
+def _resolve_roots(
+    stack: contextlib.ExitStack,
+    input_path: str,
+    passwords: List[str],
+) -> Tuple[List[Path], List[Path]]:
+    inp = Path(input_path)
+    if not inp.exists():
+        return [], []
+    do_extract = bool(passwords) or (inp.is_file() and is_archive(inp))
+    if not do_extract:
+        return [inp], []
+    workdir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-")))
+    inputs: List[Path] = []
+    if inp.is_file():
+        inputs.append(inp)
+    else:
+        inputs.append(inp)
+        for child in inp.rglob("*"):
+            if child.is_file() and is_archive(child):
+                inputs.append(child)
+    return expand_input(inputs, passwords, workdir)
+
+
+def _report_failures(failures: List[Path]) -> None:
+    if not failures:
+        return
+    print(
+        f"warning: {len(failures)} archive(s) could not be extracted "
+        f"(wrong password or missing tool):",
+        file=sys.stderr,
+    )
+    for f in failures[:10]:
+        print(f"  - {f}", file=sys.stderr)
+    if len(failures) > 10:
+        print(f"  ... and {len(failures) - 10} more", file=sys.stderr)
+
+
 def cmd_ulp(args: argparse.Namespace) -> int:
-    root = Path(args.input)
-    if not root.exists():
-        print(f"input not found: {root}", file=sys.stderr)
-        return 2
-    filters = [f.strip().lower() for f in (args.filter or "").split(",") if f.strip()]
-    out, owned = _open_out(args.output)
-    seen = set()
-    count = 0
-    try:
-        for url, user, pwd, _ in collect_credentials(root):
-            if filters:
-                hay = (url + " " + domain_of(url)).lower()
-                if not any(flt in hay for flt in filters):
-                    continue
-            line = f"{url}:{user}:{pwd}"
-            if not args.no_dedupe:
-                if line in seen:
-                    continue
-                seen.add(line)
-            out.write(line + "\n")
-            count += 1
-    finally:
-        if owned:
-            out.close()
-    print(f"wrote {count} ULP entries to {args.output}", file=sys.stderr)
-    return 0
+    with contextlib.ExitStack() as stack:
+        roots, failures = _resolve_roots(stack, args.input, args.password)
+        if not roots and not failures:
+            print(f"input not found: {args.input}", file=sys.stderr)
+            return 2
+        _report_failures(failures)
+        filters = [
+            f.strip().lower() for f in (args.filter or "").split(",") if f.strip()
+        ]
+        out, owned = _open_out(args.output)
+        seen = set()
+        count = 0
+        try:
+            for root in roots:
+                for url, user, pwd, _ in collect_credentials(root):
+                    if filters:
+                        hay = (url + " " + domain_of(url)).lower()
+                        if not any(flt in hay for flt in filters):
+                            continue
+                    line = f"{url}:{user}:{pwd}"
+                    if not args.no_dedupe:
+                        if line in seen:
+                            continue
+                        seen.add(line)
+                    out.write(line + "\n")
+                    count += 1
+        finally:
+            if owned:
+                out.close()
+        print(f"wrote {count} ULP entries to {args.output}", file=sys.stderr)
+        return 0
 
 
 def cmd_cookies(args: argparse.Namespace) -> int:
-    root = Path(args.input)
-    if not root.exists():
-        print(f"input not found: {root}", file=sys.stderr)
-        return 2
-    filters = [f.strip().lower() for f in (args.filter or "").split(",") if f.strip()]
-    cookies: List[Dict] = []
-    for cookie in collect_cookies(root):
-        domain = (cookie.get("domain") or "").lower()
-        if filters and not any(flt in domain for flt in filters):
-            continue
-        cookies.append(cookie)
-    cookies = dedupe_cookies(cookies)
+    with contextlib.ExitStack() as stack:
+        roots, failures = _resolve_roots(stack, args.input, args.password)
+        if not roots and not failures:
+            print(f"input not found: {args.input}", file=sys.stderr)
+            return 2
+        _report_failures(failures)
+        filters = [
+            f.strip().lower() for f in (args.filter or "").split(",") if f.strip()
+        ]
+        cookies: List[Dict] = []
+        for root in roots:
+            for cookie in collect_cookies(root):
+                domain = (cookie.get("domain") or "").lower()
+                if filters and not any(flt in domain for flt in filters):
+                    continue
+                cookies.append(cookie)
+        cookies = dedupe_cookies(cookies)
 
-    out_path = Path(args.output)
-    if out_path.parent and str(out_path.parent) not in ("", "."):
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path = Path(args.output)
+        if out_path.parent and str(out_path.parent) not in ("", "."):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.format == "netscape":
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(NETSCAPE_HEADER)
-            for c in cookies:
-                f.write(to_netscape_line(c) + "\n")
-    else:
-        out_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+        if args.format == "netscape":
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(NETSCAPE_HEADER)
+                for c in cookies:
+                    f.write(to_netscape_line(c) + "\n")
+        else:
+            out_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
 
-    print(f"wrote {len(cookies)} cookies to {out_path}", file=sys.stderr)
-    return 0
+        print(f"wrote {len(cookies)} cookies to {out_path}", file=sys.stderr)
+        return 0
 
 
 def cmd_sort(args: argparse.Namespace) -> int:
-    root = Path(args.input)
-    if not root.exists():
-        print(f"input not found: {root}", file=sys.stderr)
-        return 2
-    keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
-    if not keywords:
-        print("provide --keywords", file=sys.stderr)
-        return 2
-    stats = sort_logs(root, Path(args.output), keywords)
-    for k, (u, c) in stats.items():
-        print(f"  {k}: {u} ulp, {c} cookies", file=sys.stderr)
-    return 0
+    with contextlib.ExitStack() as stack:
+        roots, failures = _resolve_roots(stack, args.input, args.password)
+        if not roots and not failures:
+            print(f"input not found: {args.input}", file=sys.stderr)
+            return 2
+        _report_failures(failures)
+        keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        if not keywords:
+            print("provide --keywords", file=sys.stderr)
+            return 2
+        stats = sort_logs(roots, Path(args.output), keywords)
+        for k, (u, c) in stats.items():
+            print(f"  {k}: {u} ulp, {c} cookies", file=sys.stderr)
+        return 0
+
+
+def _add_password_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--password",
+        action="append",
+        default=[],
+        help=(
+            "Password for archived logs (.zip/.rar/.7z). May be repeated to "
+            "try several. Without --password, archives in the input are left "
+            "untouched."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -467,6 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument(
         "--no-dedupe", action="store_true", help="keep duplicate lines (default: dedupe)"
     )
+    _add_password_arg(pu)
     pu.set_defaults(func=cmd_ulp)
 
     pc = sub.add_parser("cookies", help="collect and normalize cookies")
@@ -482,6 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--filter",
         help="comma-separated keywords matched against cookie domain (substring)",
     )
+    _add_password_arg(pc)
     pc.set_defaults(func=cmd_cookies)
 
     ps = sub.add_parser(
@@ -495,6 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="comma-separated keywords (e.g. netflix,spotify,roblox)",
     )
+    _add_password_arg(ps)
     ps.set_defaults(func=cmd_sort)
 
     return p
