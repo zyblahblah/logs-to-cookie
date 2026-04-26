@@ -8,7 +8,9 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+from . import __version__
 
 from .cookies import (
     NETSCAPE_HEADER,
@@ -235,7 +237,128 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _ask(prompt: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        return default or ""
+    if not answer and default is not None:
+        return default
+    return answer
+
+
+def _ask_passwords() -> List[str]:
+    raw = _ask(
+        "Archive password(s), comma-separated (leave blank if none)", default=""
+    )
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _ask_nonempty(prompt: str, default: Optional[str] = None) -> str:
+    while True:
+        val = _ask(prompt, default=default)
+        if val:
+            return val
+        print("  (required)")
+
+
+def _build_args(**kwargs) -> argparse.Namespace:
+    ns = argparse.Namespace()
+    for k, v in kwargs.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def run_interactive() -> int:
+    """Menu-driven flow used when the CLI is run with no subcommand."""
+    print("=" * 52)
+    print(f" logs-to-cookie v{__version__} — interactive mode")
+    print("=" * 52)
+    print(" 1) ulp      — extract URL:USER:PASS")
+    print(" 2) cookies  — build cookies.txt / JSON")
+    print(" 3) sort     — bucket by keyword (ULP + cookies per keyword)")
+    print(" q) quit")
+    print()
+
+    try:
+        choice = _ask("Choose [1/2/3/q]", default="3").lower()
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+    if choice in ("q", "quit", "exit"):
+        return 0
+
+    try:
+        if choice in ("1", "ulp"):
+            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            passwords = _ask_passwords()
+            filt = _ask(
+                "Filter keywords (substring, comma-separated; blank=all)",
+                default="",
+            )
+            out = _ask("Output file (- for stdout)", default="creds.ulp.txt")
+            return cmd_ulp(
+                _build_args(
+                    input=inp,
+                    output=out,
+                    filter=filt or None,
+                    no_dedupe=False,
+                    password=passwords,
+                )
+            )
+
+        if choice in ("2", "cookies"):
+            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            passwords = _ask_passwords()
+            filt = _ask(
+                "Filter keywords (cookie domain substring; blank=all)", default=""
+            )
+            fmt_choice = _ask("Format [1=netscape, 2=json]", default="1")
+            fmt = "json" if fmt_choice.strip() in ("2", "json") else "netscape"
+            default_out = "cookies.txt" if fmt == "netscape" else "cookies.json"
+            out = _ask("Output file", default=default_out)
+            return cmd_cookies(
+                _build_args(
+                    input=inp,
+                    output=out,
+                    format=fmt,
+                    filter=filt or None,
+                    password=passwords,
+                )
+            )
+
+        if choice in ("3", "sort"):
+            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            passwords = _ask_passwords()
+            keywords = _ask_nonempty(
+                "Keywords to sort by (comma-separated, e.g. netflix,spotify,roblox)"
+            )
+            out = _ask("Output directory", default="sorted")
+            return cmd_sort(
+                _build_args(
+                    input=inp,
+                    output=out,
+                    keywords=keywords,
+                    password=passwords,
+                )
+            )
+    except KeyboardInterrupt:
+        print("\naborted")
+        return 130
+
+    print(f"unknown choice: {choice!r}")
+    return 2
+
+
 def main(argv=None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        return run_interactive()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
