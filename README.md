@@ -12,17 +12,17 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
-## Sort with one folder per hit (`sort --per-source`)
+## Sort with one folder per hit (default behavior)
 
 This is the most common workflow when the input is a stealer dump containing
 many per-victim folders: for each `--keywords` match found inside a victim's
 folder, that victim gets its own sub-folder under the keyword bucket, with a
 `cookies.txt` (and `creds.txt` when there's a matching credential) for that
-victim only.
+victim only. **This is the default** as of `v0.6.0` — no extra flag needed:
 
 ```
 python logs_to_cookie.py sort logs.zip --password "$PW" \
-    --keywords netflix,claude --per-source -o sorted/
+    --keywords netflix,claude -o sorted/
 ```
 
 Produces:
@@ -49,19 +49,19 @@ sanitized to `_`). Victims with no matches are skipped entirely.
 In interactive mode, pick `3) sort` and just press Enter at *"One folder per
 hit (keyword/victim/cookies.txt)? [Y/n]"* — `Y` is the default.
 
-Without `--per-source`, the legacy `<keyword>.ulp.txt` + `<keyword>.cookies.txt`
-files are produced (everything merged across victims).
+Pass `--no-per-source` if you want the legacy merged
+`<keyword>.ulp.txt` + `<keyword>.cookies.txt` layout (everything merged across
+victims).
 
-## One folder per source/victim (`cookies --per-source`)
+## Cookies — one folder per source/victim (default)
 
-If you want one ready-to-use session per victim — e.g. to import into a
-browser or hand off separately — pass `--per-source` to the `cookies`
-command. The `--output` then becomes a directory; each source (victim)
-gets its own folder containing a single `cookies.txt` (or `cookies.json`
+By default, the `cookies` command also produces one folder per source. The
+`--output` is treated as a directory; each source (victim) gets its own
+folder containing a single `cookies.txt` (or `cookies.json`
 with `--format json`) for that source only.
 
 ```
-python logs_to_cookie.py cookies logs.zip --password 1234 --per-source -o cookies_out/
+python logs_to_cookie.py cookies logs.zip --password 1234 -o cookies_out/
 ```
 
 Produces:

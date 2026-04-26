@@ -138,7 +138,7 @@ def test_sort_per_source_skips_unmatched_victims(logs_dir: Path, tmp_path: Path)
     assert dirs == ["ADMIN__v_d_e__3_"]
 
 
-def test_sort_default_layout_unchanged(logs_dir: Path, tmp_path: Path):
+def test_sort_legacy_layout_via_no_per_source(logs_dir: Path, tmp_path: Path):
     out = tmp_path / "sorted_legacy"
     rc = cmd_sort(
         _args(
@@ -154,3 +154,28 @@ def test_sort_default_layout_unchanged(logs_dir: Path, tmp_path: Path):
     text = (out / "netflix.cookies.txt").read_text(encoding="utf-8")
     # Legacy mode merges cookies from multiple victims.
     assert "tok_a" in text and "tok_c" in text
+
+
+def test_argparse_per_source_defaults_true():
+    """Both `sort` and `cookies` must default to per-source organization."""
+    from logs_to_cookie.cli import build_parser
+
+    p = build_parser()
+    sort_ns = p.parse_args(
+        ["sort", "/tmp/x", "-o", "/tmp/y", "--keywords", "netflix"]
+    )
+    cookies_ns = p.parse_args(["cookies", "/tmp/x", "-o", "/tmp/y"])
+    assert sort_ns.per_source is True
+    assert cookies_ns.per_source is True
+    sort_off = p.parse_args(
+        [
+            "sort",
+            "/tmp/x",
+            "-o",
+            "/tmp/y",
+            "--keywords",
+            "netflix",
+            "--no-per-source",
+        ]
+    )
+    assert sort_off.per_source is False
