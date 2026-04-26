@@ -9,8 +9,9 @@ Supports two on-disk formats commonly found in logs:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List
+from typing import Dict, Iterable, Iterator, List, Tuple
 
 NETSCAPE_HEADER = (
     "# Netscape HTTP Cookie File\n"
@@ -137,6 +138,14 @@ def iter_cookie_files(root: Path) -> Iterator[Path]:
 
 
 def collect_cookies(root: Path) -> Iterator[Dict]:
+    for cookie, _src in collect_cookies_with_source(root):
+        yield cookie
+
+
+def collect_cookies_with_source(root: Path) -> Iterator[Tuple[Dict, Path]]:
+    """Yield ``(cookie, source_file)`` tuples — same as :func:`collect_cookies`
+    but also exposes the originating file so callers can group by victim.
+    """
     for path in iter_cookie_files(root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -144,17 +153,49 @@ def collect_cookies(root: Path) -> Iterator[Dict]:
             continue
         if not text.strip():
             continue
-        # Try JSON first when it looks like JSON.
         stripped = text.lstrip()
         if path.suffix.lower() == ".json" or stripped.startswith(("[", "{")):
             yielded = False
             for cookie in parse_json_cookies(text):
                 yielded = True
-                yield cookie
+                yield cookie, path
             if yielded:
                 continue
-        # Fall back to Netscape format.
-        yield from parse_netscape(text)
+        for cookie in parse_netscape(text):
+            yield cookie, path
+
+
+_ARCHIVE_TEMPDIR_RE = re.compile(r"^x\d{3}_")
+
+
+def source_name_for(path: Path, root: Path) -> str:
+    """Derive a human-friendly ``source`` (usually victim) name for ``path``.
+
+    - ``root/victim01/Cookies/foo.txt`` -> ``"victim01"``
+    - ``root/Cookies/foo.txt`` -> root's name.
+    - Strips the ``xNNN_`` prefix the extraction helper adds to temp dirs.
+    """
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        name = path.parent.name or "unknown"
+        return _ARCHIVE_TEMPDIR_RE.sub("", name) or "unknown"
+
+    parts = rel.parts
+    if parts and parts[0].lower() in ("cookies", "cookie"):
+        name = root.name or "unknown"
+    elif parts:
+        name = parts[0]
+    else:
+        name = root.name or "unknown"
+    return _ARCHIVE_TEMPDIR_RE.sub("", name) or "unknown"
+
+
+def safe_source_name(name: str) -> str:
+    cleaned = "".join(
+        c if c.isalnum() or c in "-_." else "_" for c in (name or "").strip()
+    )
+    return cleaned or "unknown"
 
 
 def dedupe(cookies: Iterable[Dict]) -> List[Dict]:
