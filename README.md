@@ -101,6 +101,38 @@ sorted/
   ...
 ```
 
+## Password-protected archives
+
+Most logs are shipped as password-protected `.zip` (sometimes `.rar` /
+`.7z`) bundles. Pass `--password` and the tool will extract the archive
+to a temp dir, recurse into nested archives, and process the result —
+no manual unzip step required:
+
+```bash
+# single archive
+python -m logs_to_cookie sort logs.zip --password "1234" \
+    --keywords netflix,spotify -o sorted/
+
+# directory of archives, try multiple passwords in order
+python -m logs_to_cookie ulp /downloads/logs/ \
+    --password "1234" --password "letmein" -o creds.txt
+```
+
+`--password` is repeatable: each is tried until one succeeds. Archives
+that none of the passwords unlock are reported on stderr but do not
+abort the run.
+
+Format support:
+
+| Format | Requirement |
+| ------ | ----------- |
+| `.zip` | stdlib (no extra install) |
+| `.rar` | `unrar` or `7z` / `7za` on `$PATH` |
+| `.7z`  | `7z` / `7za` / `7zz` on `$PATH` |
+
+If a `.rar` / `.7z` is encountered without the matching tool, the
+archive is reported in the failure list and skipped.
+
 ## Expected log layout
 
 The tool is intentionally lenient. A typical stealer log folder works
