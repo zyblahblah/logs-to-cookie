@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -272,6 +272,12 @@ def iter_cookie_files(root: Path) -> Iterator[Path]:
 
 
 def collect_cookies(root: Path) -> Iterator[Dict]:
+    for cookie, _src in collect_cookies_with_source(root):
+        yield cookie
+
+
+def collect_cookies_with_source(root: Path) -> Iterator[Tuple[Dict, Path]]:
+    """Like :func:`collect_cookies` but also yields the originating file."""
     for path in iter_cookie_files(root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -284,10 +290,39 @@ def collect_cookies(root: Path) -> Iterator[Dict]:
             yielded = False
             for cookie in parse_json_cookies(text):
                 yielded = True
-                yield cookie
+                yield cookie, path
             if yielded:
                 continue
-        yield from parse_netscape(text)
+        for cookie in parse_netscape(text):
+            yield cookie, path
+
+
+_ARCHIVE_TEMPDIR_RE = re.compile(r"^x\d{3}_")
+
+
+def source_name_for(path: Path, root: Path) -> str:
+    """Derive a human-friendly source (victim) name for ``path`` under ``root``."""
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        name = path.parent.name or "unknown"
+        return _ARCHIVE_TEMPDIR_RE.sub("", name) or "unknown"
+
+    parts = rel.parts
+    if parts and parts[0].lower() in ("cookies", "cookie"):
+        name = root.name or "unknown"
+    elif parts:
+        name = parts[0]
+    else:
+        name = root.name or "unknown"
+    return _ARCHIVE_TEMPDIR_RE.sub("", name) or "unknown"
+
+
+def safe_source_name(name: str) -> str:
+    cleaned = "".join(
+        c if c.isalnum() or c in "-_." else "_" for c in (name or "").strip()
+    )
+    return cleaned or "unknown"
 
 
 def dedupe_cookies(cookies: Iterable[Dict]) -> List[Dict]:
@@ -609,6 +644,18 @@ def cmd_ulp(args: argparse.Namespace) -> int:
         return 0
 
 
+def _write_cookies_file(path: Path, cookies: List[Dict], fmt: str) -> None:
+    if path.parent and str(path.parent) not in ("", "."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "netscape":
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(NETSCAPE_HEADER)
+            for c in cookies:
+                f.write(to_netscape_line(c) + "\n")
+    else:
+        path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+
+
 def cmd_cookies(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
         roots, failures = _resolve_roots(stack, args.input, args.password)
@@ -619,6 +666,39 @@ def cmd_cookies(args: argparse.Namespace) -> int:
         filters = [
             f.strip().lower() for f in (args.filter or "").split(",") if f.strip()
         ]
+        per_source = getattr(args, "per_source", False)
+
+        if per_source:
+            out_dir = Path(args.output)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            filename = "cookies.txt" if args.format == "netscape" else "cookies.json"
+
+            groups: Dict[str, List[Dict]] = {}
+            for root in roots:
+                for cookie, src_path in collect_cookies_with_source(root):
+                    domain = (cookie.get("domain") or "").lower()
+                    if filters and not any(flt in domain for flt in filters):
+                        continue
+                    name = safe_source_name(source_name_for(src_path, root))
+                    groups.setdefault(name, []).append(cookie)
+
+            total = 0
+            for name in sorted(groups):
+                deduped = dedupe_cookies(groups[name])
+                if not deduped:
+                    continue
+                _write_cookies_file(out_dir / name / filename, deduped, args.format)
+                total += len(deduped)
+                print(
+                    f"  {name}: {len(deduped)} cookies -> {out_dir / name / filename}",
+                    file=sys.stderr,
+                )
+            print(
+                f"wrote {total} cookies across {len(groups)} source(s) to {out_dir}",
+                file=sys.stderr,
+            )
+            return 0
+
         cookies: List[Dict] = []
         for root in roots:
             for cookie in collect_cookies(root):
@@ -629,17 +709,7 @@ def cmd_cookies(args: argparse.Namespace) -> int:
         cookies = dedupe_cookies(cookies)
 
         out_path = Path(args.output)
-        if out_path.parent and str(out_path.parent) not in ("", "."):
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if args.format == "netscape":
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(NETSCAPE_HEADER)
-                for c in cookies:
-                    f.write(to_netscape_line(c) + "\n")
-        else:
-            out_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
-
+        _write_cookies_file(out_path, cookies, args.format)
         print(f"wrote {len(cookies)} cookies to {out_path}", file=sys.stderr)
         return 0
 
@@ -697,7 +767,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     pc = sub.add_parser("cookies", help="collect and normalize cookies")
     pc.add_argument("input", help="path to log directory or file")
-    pc.add_argument("-o", "--output", required=True, help="output file path")
+    pc.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help=(
+            "output file path (default), or output directory when "
+            "--per-source is set"
+        ),
+    )
     pc.add_argument(
         "--format",
         choices=["netscape", "json"],
@@ -707,6 +785,14 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument(
         "--filter",
         help="comma-separated keywords matched against cookie domain (substring)",
+    )
+    pc.add_argument(
+        "--per-source",
+        action="store_true",
+        help=(
+            "write one folder per source (victim) under --output, each "
+            "containing a single cookies.txt/.json for that source"
+        ),
     )
     _add_password_arg(pc)
     pc.set_defaults(func=cmd_cookies)
@@ -816,14 +902,22 @@ def run_interactive() -> int:
             )
             fmt_choice = _ask("Format [1=netscape, 2=json]", default="1")
             fmt = "json" if fmt_choice.strip() in ("2", "json") else "netscape"
-            default_out = "cookies.txt" if fmt == "netscape" else "cookies.json"
-            out = _ask("Output file", default=default_out)
+            per_src_ans = _ask(
+                "One folder per source/victim? [y/N]", default="n"
+            ).lower()
+            per_source = per_src_ans in ("y", "yes", "1", "true")
+            if per_source:
+                out = _ask("Output directory", default="cookies_out")
+            else:
+                default_out = "cookies.txt" if fmt == "netscape" else "cookies.json"
+                out = _ask("Output file", default=default_out)
             return cmd_cookies(
                 _build_args(
                     input=inp,
                     output=out,
                     format=fmt,
                     filter=filt or None,
+                    per_source=per_source,
                     password=passwords,
                 )
             )

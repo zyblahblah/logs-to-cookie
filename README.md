@@ -12,6 +12,31 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
+## One folder per source/victim (`cookies --per-source`)
+
+If you want one ready-to-use session per victim — e.g. to import into a
+browser or hand off separately — pass `--per-source` to the `cookies`
+command. The `--output` then becomes a directory; each source (victim)
+gets its own folder containing a single `cookies.txt` (or `cookies.json`
+with `--format json`) for that source only.
+
+```
+python logs_to_cookie.py cookies logs.zip --password 1234 --per-source -o cookies_out/
+```
+
+Produces:
+```
+cookies_out/
+  victim01/
+    cookies.txt
+  victim02/
+    cookies.txt
+  victim03/
+    cookies.txt
+```
+
+In interactive mode, just answer `y` to *"One folder per source/victim?"*.
+
 ## Quick start (no CLI flags)
 
 If you don't want to type flags (e.g. running from a mobile launcher, Termux,
