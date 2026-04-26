@@ -12,13 +12,14 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
-## Sort with one folder per hit (default behavior)
+## Sort: one folder per victim with a hit (default behavior)
 
 This is the most common workflow when the input is a stealer dump containing
-many per-victim folders: for each `--keywords` match found inside a victim's
-folder, that victim gets its own sub-folder under the keyword bucket, with a
-`cookies.txt` (and `creds.txt` when there's a matching credential) for that
-victim only. **This is the default** as of `v0.6.0` — no extra flag needed:
+many per-victim folders. The `--keywords` are used as a *filter*: every
+victim folder that has at least one match (in its passwords or cookies) gets
+its own folder under `--output`, containing a single `cookies.txt` (and
+`creds.txt` if there were any matching credentials) for that victim. **This
+is the default** as of `v0.7.0` — no extra flag needed:
 
 ```
 python logs_to_cookie.py sort logs.zip --password "$PW" \
@@ -28,30 +29,28 @@ python logs_to_cookie.py sort logs.zip --password "$PW" \
 Produces:
 ```
 sorted/
-  netflix/
-    ADMIN_@v_d_e_(1)/
-      cookies.txt
-      creds.txt
-    ADMIN_@v_d_e_(2)/
-      cookies.txt
-    ...
-  claude/
-    ADMIN_@v_d_e_(3)/
-      cookies.txt
-    ...
+  ADMIN_@v_d_e_(1)/
+    cookies.txt
+    creds.txt
+  ADMIN_@v_d_e_(3)/
+    cookies.txt
+    creds.txt
+  ...
 ```
 
 Each `cookies.txt` is fully importable on its own (curl `-b`, browser cookie
 extension, etc.) — one ready-to-use session per hit. Folder names are derived
 from the victim folder inside the archive (with filesystem-unsafe characters
-sanitized to `_`). Victims with no matches are skipped entirely.
+sanitized to `_`). Victims with no matches are skipped entirely. A victim's
+`cookies.txt` contains every keyword-matching cookie they had (across all
+keywords) — it is *not* split per keyword.
 
 In interactive mode, pick `3) sort` and just press Enter at *"One folder per
-hit (keyword/victim/cookies.txt)? [Y/n]"* — `Y` is the default.
+victim with a hit (victim/cookies.txt)? [Y/n]"* — `Y` is the default.
 
 Pass `--no-per-source` if you want the legacy merged
-`<keyword>.ulp.txt` + `<keyword>.cookies.txt` layout (everything merged across
-victims).
+`<keyword>.ulp.txt` + `<keyword>.cookies.txt` layout (everything merged
+across victims, grouped by keyword).
 
 ## Cookies — one folder per source/victim (default)
 
