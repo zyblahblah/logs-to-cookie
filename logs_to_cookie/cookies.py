@@ -193,7 +193,7 @@ def source_name_for(path: Path, root: Path) -> str:
 
 def safe_source_name(name: str) -> str:
     cleaned = "".join(
-        c if c.isalnum() or c in "-_." else "_" for c in (name or "").strip()
+        c if c.isalnum() or c in "-_.[]()" else "_" for c in (name or "").strip()
     )
     return cleaned or "unknown"
 

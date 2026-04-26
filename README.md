@@ -12,14 +12,15 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
-## Sort: one folder per victim with a hit (default behavior)
+## Sort: per-victim folder, one Netscape file per source cookie file (default)
 
 This is the most common workflow when the input is a stealer dump containing
-many per-victim folders. The `--keywords` are used as a *filter*: every
-victim folder that has at least one match (in its passwords or cookies) gets
-its own folder under `--output`, containing a single `cookies.txt` (and
-`creds.txt` if there were any matching credentials) for that victim. **This
-is the default** as of `v0.7.0` — no extra flag needed:
+many per-victim folders, each with several browser-profile cookie files
+(`Brave_Default.txt`, `Chrome_Default.txt`, `Brave-Browser_Default_[2F5F].txt`,
+…). The `--keywords` are used as a *filter*: every source cookie file with at
+least one matching cookie is converted to its own Netscape `cookies.txt`,
+written under that victim's output folder. Source files with no matches are
+skipped. **This is the default** as of `v0.8.0` — no extra flag needed:
 
 ```
 python logs_to_cookie.py sort logs.zip --password "$PW" \
@@ -30,20 +31,28 @@ Produces:
 ```
 sorted/
   ADMIN_@v_d_e_(1)/
-    cookies.txt
+    Brave-Browser_Default_[2F5F].txt_82fcdd.txt
+    Brave-Browser_Default_[F362].txt_42d2be.txt
+    Brave-Default-Cookies.txt_c87543.txt
+    Brave_0.txt_954c39.txt
+    Brave_Default.txt_78e541.txt
+    Chrome_Default.txt_bccb04.txt
     creds.txt
   ADMIN_@v_d_e_(3)/
-    cookies.txt
+    Brave_Default.txt_d39f62.txt
+    Chrome_Default.txt_5edc7c.txt
     creds.txt
   ...
 ```
 
-Each `cookies.txt` is fully importable on its own (curl `-b`, browser cookie
-extension, etc.) — one ready-to-use session per hit. Folder names are derived
-from the victim folder inside the archive (with filesystem-unsafe characters
-sanitized to `_`). Victims with no matches are skipped entirely. A victim's
-`cookies.txt` contains every keyword-matching cookie they had (across all
-keywords) — it is *not* split per keyword.
+Each generated `*.txt` is a standalone Netscape `cookies.txt` (header +
+tab-separated 7-column lines), importable on its own with curl `-b`, yt-dlp,
+or any browser cookie-import extension. The trailing 6-character hex hash on
+the filename keeps two profiles with the same basename (e.g. multiple
+`Cookies.txt` from different browser-profile dirs) from colliding. Folder and
+file names are sanitized so that brackets `[]`, parens `()`, dots, hyphens
+and underscores are kept; everything else is replaced with `_`. Victims with
+no matches at all are skipped entirely.
 
 In interactive mode, pick `3) sort` and just press Enter at *"One folder per
 victim with a hit (victim/cookies.txt)? [Y/n]"* — `Y` is the default.

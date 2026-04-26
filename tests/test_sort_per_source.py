@@ -1,4 +1,4 @@
-"""Tests for `sort --per-source` (flat per-victim layout)."""
+"""Tests for `sort --per-source` (per-victim folder, one Netscape file per source)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,11 @@ def _make_victim(
     creds: list,
     cookies: list,
 ) -> None:
-    """Create one victim folder with Passwords.txt + Cookies/*.txt."""
+    """Create one victim folder with Passwords.txt + Cookies/*.txt.
+
+    Each entry in ``cookies`` becomes its own file under ``Cookies/`` so the
+    per-source-file output layout has something to split on.
+    """
     base = root / name
     base.mkdir(parents=True, exist_ok=True)
     if creds:
@@ -57,7 +61,7 @@ def logs_dir(tmp_path: Path) -> Path:
         creds=[("https://claude.ai/login", "carol", "pw_c")],
         cookies=[
             ("netflix.com", "Sess3", "tok_c"),
-            ("claude.ai", "Sess3", "tok_c"),
+            ("claude.ai", "Sess3c", "tok_cc"),
         ],
     )
     _make_victim(
@@ -78,8 +82,12 @@ def _args(**kw):
     return ns
 
 
-def test_flat_per_victim_layout(logs_dir: Path, tmp_path: Path):
-    """Each victim with any keyword hit gets a flat folder under <output>/."""
+def _list_files(d: Path) -> list:
+    return sorted(p.name for p in d.iterdir() if p.is_file())
+
+
+def test_per_source_file_layout(logs_dir: Path, tmp_path: Path):
+    """Each matching source cookie file becomes its own Netscape file."""
     out = tmp_path / "sorted"
     rc = cmd_sort(
         _args(
@@ -90,33 +98,45 @@ def test_flat_per_victim_layout(logs_dir: Path, tmp_path: Path):
     )
     assert rc == 0
 
-    # Output should be FLAT: <out>/<victim>/cookies.txt — no keyword sub-tree.
+    # No per-keyword folders.
     assert not (out / "netflix").exists()
     assert not (out / "claude").exists()
 
     dirs = sorted(p.name for p in out.iterdir() if p.is_dir())
-    # victim_one (netflix), victim_three (netflix + claude). NOT victim_two/four.
     assert dirs == ["victim_one", "victim_three"], dirs
 
-    # victim_one carries netflix cookies + creds.
-    v1_cookies = (out / "victim_one" / "cookies.txt").read_text(encoding="utf-8")
-    v1_creds = (out / "victim_one" / "creds.txt").read_text(encoding="utf-8")
-    assert "tok_a" in v1_cookies and "tok_c" not in v1_cookies
-    assert "alice:pw_a" in v1_creds
+    # victim_one: 1 source cookie file (netflix) + creds.txt
+    v1_files = _list_files(out / "victim_one")
+    cookie_files_v1 = [f for f in v1_files if f != "creds.txt"]
+    assert len(cookie_files_v1) == 1, v1_files
+    fname = cookie_files_v1[0]
+    # Should preserve original cookie source filename + hash + .txt
+    assert "0_netflix.com.txt" in fname and fname.endswith(".txt")
+    text = (out / "victim_one" / fname).read_text(encoding="utf-8")
+    assert text.startswith("# Netscape HTTP Cookie File")
+    assert ".netflix.com" in text
+    assert "tok_a" in text
+    assert "creds.txt" in v1_files
 
-    # victim_three carries cookies for BOTH matching keywords in one cookies.txt.
-    v3_cookies = (out / "victim_three" / "cookies.txt").read_text(encoding="utf-8")
-    assert "tok_c" in v3_cookies
-    # Both netflix.com and claude.ai cookies live in the same file.
-    assert ".netflix.com" in v3_cookies
-    assert ".claude.ai" in v3_cookies
+    # victim_three: 2 separate source files (netflix + claude), each its own output
+    v3_files = _list_files(out / "victim_three")
+    cookie_files_v3 = [f for f in v3_files if f != "creds.txt"]
+    assert len(cookie_files_v3) == 2, v3_files
 
-    # victim_three had a claude credential, so creds.txt also exists.
-    v3_creds = (out / "victim_three" / "creds.txt").read_text(encoding="utf-8")
-    assert "carol:pw_c" in v3_creds
+    # Each output file contains exactly the cookies from its source file.
+    netflix_out = next(f for f in cookie_files_v3 if "netflix.com" in f)
+    claude_out = next(f for f in cookie_files_v3 if "claude.ai" in f)
+    nf_text = (out / "victim_three" / netflix_out).read_text(encoding="utf-8")
+    cl_text = (out / "victim_three" / claude_out).read_text(encoding="utf-8")
+    # Each file is independently Netscape-formatted with its own header.
+    assert nf_text.startswith("# Netscape HTTP Cookie File")
+    assert cl_text.startswith("# Netscape HTTP Cookie File")
+    # Domains are NOT cross-contaminated between source files.
+    assert ".netflix.com" in nf_text and ".claude.ai" not in nf_text
+    assert ".claude.ai" in cl_text and ".netflix.com" not in cl_text
 
 
-def test_flat_skips_victims_without_match(logs_dir: Path, tmp_path: Path):
+def test_skips_victims_and_files_without_match(logs_dir: Path, tmp_path: Path):
     out = tmp_path / "sorted2"
     rc = cmd_sort(
         _args(input=str(logs_dir), output=str(out), keywords="claude")
@@ -124,11 +144,41 @@ def test_flat_skips_victims_without_match(logs_dir: Path, tmp_path: Path):
     assert rc == 0
     dirs = sorted(p.name for p in out.iterdir() if p.is_dir())
     assert dirs == ["victim_three"]
-    # Only the matching cookies are written for that victim.
-    text = (out / "victim_three" / "cookies.txt").read_text(encoding="utf-8")
+
+    # Only the claude.ai source file should produce output, not the netflix one.
+    files = _list_files(out / "victim_three")
+    cookie_files = [f for f in files if f != "creds.txt"]
+    assert len(cookie_files) == 1, files
+    assert "claude.ai" in cookie_files[0]
+    text = (out / "victim_three" / cookie_files[0]).read_text(encoding="utf-8")
     assert ".claude.ai" in text
-    # netflix.com cookie shouldn't be there since it wasn't a claude match.
     assert ".netflix.com" not in text
+
+
+def test_hash_disambiguates_same_basename(tmp_path: Path):
+    """Two source files with the same basename get unique outputs."""
+    root = tmp_path / "logs"
+    base = root / "victim_x"
+    (base / "Profile1" / "Cookies").mkdir(parents=True, exist_ok=True)
+    (base / "Profile2" / "Cookies").mkdir(parents=True, exist_ok=True)
+    (base / "Profile1" / "Cookies" / "Cookies.txt").write_text(
+        "# Netscape\n.netflix.com\tTRUE\t/\tTRUE\t1900000000\tA\t1\n",
+        encoding="utf-8",
+    )
+    (base / "Profile2" / "Cookies" / "Cookies.txt").write_text(
+        "# Netscape\n.netflix.com\tTRUE\t/\tTRUE\t1900000000\tB\t2\n",
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "sorted"
+    rc = cmd_sort(
+        _args(input=str(root), output=str(out), keywords="netflix")
+    )
+    assert rc == 0
+    files = _list_files(out / "victim_x")
+    cookie_files = [f for f in files if f != "creds.txt"]
+    assert len(cookie_files) == 2, cookie_files
+    assert len(set(cookie_files)) == 2  # unique
 
 
 def test_legacy_merged_via_no_per_source(logs_dir: Path, tmp_path: Path):
@@ -144,7 +194,6 @@ def test_legacy_merged_via_no_per_source(logs_dir: Path, tmp_path: Path):
     assert rc == 0
     assert (out / "netflix.ulp.txt").is_file()
     assert (out / "netflix.cookies.txt").is_file()
-    # Legacy mode merges netflix cookies from victim_one + victim_three.
     text = (out / "netflix.cookies.txt").read_text(encoding="utf-8")
     assert "tok_a" in text and "tok_c" in text
 
