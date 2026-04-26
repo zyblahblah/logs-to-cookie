@@ -12,6 +12,46 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
+## Sort with one folder per hit (`sort --per-source`)
+
+This is the most common workflow when the input is a stealer dump containing
+many per-victim folders: for each `--keywords` match found inside a victim's
+folder, that victim gets its own sub-folder under the keyword bucket, with a
+`cookies.txt` (and `creds.txt` when there's a matching credential) for that
+victim only.
+
+```
+python logs_to_cookie.py sort logs.zip --password "$PW" \
+    --keywords netflix,claude --per-source -o sorted/
+```
+
+Produces:
+```
+sorted/
+  netflix/
+    ADMIN_@v_d_e_(1)/
+      cookies.txt
+      creds.txt
+    ADMIN_@v_d_e_(2)/
+      cookies.txt
+    ...
+  claude/
+    ADMIN_@v_d_e_(3)/
+      cookies.txt
+    ...
+```
+
+Each `cookies.txt` is fully importable on its own (curl `-b`, browser cookie
+extension, etc.) — one ready-to-use session per hit. Folder names are derived
+from the victim folder inside the archive (with filesystem-unsafe characters
+sanitized to `_`). Victims with no matches are skipped entirely.
+
+In interactive mode, pick `3) sort` and just press Enter at *"One folder per
+hit (keyword/victim/cookies.txt)? [Y/n]"* — `Y` is the default.
+
+Without `--per-source`, the legacy `<keyword>.ulp.txt` + `<keyword>.cookies.txt`
+files are produced (everything merged across victims).
+
 ## One folder per source/victim (`cookies --per-source`)
 
 If you want one ready-to-use session per victim — e.g. to import into a
