@@ -1,10 +1,9 @@
-"""Tests for `sort --per-source` (per-keyword, per-victim folder layout)."""
+"""Tests for `sort --per-source` (flat per-victim layout)."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from textwrap import dedent
 
 import pytest
 
@@ -42,19 +41,19 @@ def logs_dir(tmp_path: Path) -> Path:
     root = tmp_path / "logs"
     _make_victim(
         root,
-        "ADMIN @v_d_e (1)",
+        "victim_one",
         creds=[("https://www.netflix.com/", "alice", "pw_a")],
         cookies=[("netflix.com", "Sess1", "tok_a")],
     )
     _make_victim(
         root,
-        "ADMIN @v_d_e (2)",
+        "victim_two",
         creds=[("https://www.spotify.com/login", "bob", "pw_b")],
         cookies=[("spotify.com", "Sess2", "tok_b")],
     )
     _make_victim(
         root,
-        "ADMIN @v_d_e (3)",
+        "victim_three",
         creds=[("https://claude.ai/login", "carol", "pw_c")],
         cookies=[
             ("netflix.com", "Sess3", "tok_c"),
@@ -63,7 +62,7 @@ def logs_dir(tmp_path: Path) -> Path:
     )
     _make_victim(
         root,
-        "ADMIN @v_d_e (4)",
+        "victim_four",
         creds=[("https://example.com/", "dave", "pw_d")],
         cookies=[("example.com", "Sess4", "tok_d")],
     )
@@ -79,66 +78,60 @@ def _args(**kw):
     return ns
 
 
-def test_sort_per_source_layout(logs_dir: Path, tmp_path: Path):
+def test_flat_per_victim_layout(logs_dir: Path, tmp_path: Path):
+    """Each victim with any keyword hit gets a flat folder under <output>/."""
     out = tmp_path / "sorted"
     rc = cmd_sort(
         _args(
             input=str(logs_dir),
             output=str(out),
-            keywords="netflix,spotify,claude",
+            keywords="netflix,claude",
         )
     )
     assert rc == 0
 
-    # Folder names get sanitized: @ and () become _.
-    v1_dir = "ADMIN__v_d_e__1_"
-    v3_dir = "ADMIN__v_d_e__3_"
+    # Output should be FLAT: <out>/<victim>/cookies.txt — no keyword sub-tree.
+    assert not (out / "netflix").exists()
+    assert not (out / "claude").exists()
 
-    # netflix should match victims (1) and (3) via cookies (and (1) via creds).
-    netflix_dirs = sorted(p.name for p in (out / "netflix").iterdir())
-    assert netflix_dirs == [v1_dir, v3_dir], netflix_dirs
+    dirs = sorted(p.name for p in out.iterdir() if p.is_dir())
+    # victim_one (netflix), victim_three (netflix + claude). NOT victim_two/four.
+    assert dirs == ["victim_one", "victim_three"], dirs
 
-    # Each victim's folder should hold cookies.txt for that victim only.
-    v1_cookies = (out / "netflix" / v1_dir / "cookies.txt").read_text(
-        encoding="utf-8"
-    )
-    assert "tok_a" in v1_cookies
-    assert "tok_c" not in v1_cookies
-
-    v3_cookies = (out / "netflix" / v3_dir / "cookies.txt").read_text(
-        encoding="utf-8"
-    )
-    assert "tok_c" in v3_cookies
-    assert "tok_a" not in v3_cookies
-
-    # Victim (1) had a netflix credential, so creds.txt should also exist.
-    v1_creds = (out / "netflix" / v1_dir / "creds.txt").read_text(encoding="utf-8")
+    # victim_one carries netflix cookies + creds.
+    v1_cookies = (out / "victim_one" / "cookies.txt").read_text(encoding="utf-8")
+    v1_creds = (out / "victim_one" / "creds.txt").read_text(encoding="utf-8")
+    assert "tok_a" in v1_cookies and "tok_c" not in v1_cookies
     assert "alice:pw_a" in v1_creds
 
-    # claude bucket: only victim (3).
-    claude_dirs = sorted(p.name for p in (out / "claude").iterdir())
-    assert claude_dirs == [v3_dir]
+    # victim_three carries cookies for BOTH matching keywords in one cookies.txt.
+    v3_cookies = (out / "victim_three" / "cookies.txt").read_text(encoding="utf-8")
+    assert "tok_c" in v3_cookies
+    # Both netflix.com and claude.ai cookies live in the same file.
+    assert ".netflix.com" in v3_cookies
+    assert ".claude.ai" in v3_cookies
 
-    # Victim (4) (example.com) must NOT appear under any keyword bucket.
-    for kw in ("netflix", "spotify", "claude"):
-        if (out / kw).exists():
-            for p in (out / kw).iterdir():
-                assert "_4_" not in p.name
+    # victim_three had a claude credential, so creds.txt also exists.
+    v3_creds = (out / "victim_three" / "creds.txt").read_text(encoding="utf-8")
+    assert "carol:pw_c" in v3_creds
 
 
-def test_sort_per_source_skips_unmatched_victims(logs_dir: Path, tmp_path: Path):
+def test_flat_skips_victims_without_match(logs_dir: Path, tmp_path: Path):
     out = tmp_path / "sorted2"
     rc = cmd_sort(
         _args(input=str(logs_dir), output=str(out), keywords="claude")
     )
     assert rc == 0
-    # Only the claude bucket exists, with one victim.
-    assert (out / "claude").is_dir()
-    dirs = sorted(p.name for p in (out / "claude").iterdir())
-    assert dirs == ["ADMIN__v_d_e__3_"]
+    dirs = sorted(p.name for p in out.iterdir() if p.is_dir())
+    assert dirs == ["victim_three"]
+    # Only the matching cookies are written for that victim.
+    text = (out / "victim_three" / "cookies.txt").read_text(encoding="utf-8")
+    assert ".claude.ai" in text
+    # netflix.com cookie shouldn't be there since it wasn't a claude match.
+    assert ".netflix.com" not in text
 
 
-def test_sort_legacy_layout_via_no_per_source(logs_dir: Path, tmp_path: Path):
+def test_legacy_merged_via_no_per_source(logs_dir: Path, tmp_path: Path):
     out = tmp_path / "sorted_legacy"
     rc = cmd_sort(
         _args(
@@ -151,8 +144,8 @@ def test_sort_legacy_layout_via_no_per_source(logs_dir: Path, tmp_path: Path):
     assert rc == 0
     assert (out / "netflix.ulp.txt").is_file()
     assert (out / "netflix.cookies.txt").is_file()
+    # Legacy mode merges netflix cookies from victim_one + victim_three.
     text = (out / "netflix.cookies.txt").read_text(encoding="utf-8")
-    # Legacy mode merges cookies from multiple victims.
     assert "tok_a" in text and "tok_c" in text
 
 
