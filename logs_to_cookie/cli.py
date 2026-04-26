@@ -364,10 +364,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pc.add_argument(
         "--per-source",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "write one folder per source (victim) under --output, each "
-            "containing a single cookies.txt/.json for that source"
+            "containing a single cookies.txt/.json for that source. "
+            "Default is on; pass --no-per-source for a single merged file."
         ),
     )
     _add_password_arg(pc)
@@ -386,11 +388,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ps.add_argument(
         "--per-source",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "instead of one ulp.txt + cookies.txt per keyword, write one "
-            "folder per (keyword, victim) hit: "
-            "<output>/<keyword>/<victim>/cookies.txt + creds.txt"
+            "write one folder per (keyword, victim) hit "
+            "(<output>/<keyword>/<victim>/cookies.txt + creds.txt). "
+            "Default is on; pass --no-per-source for the legacy merged "
+            "<keyword>.ulp.txt + <keyword>.cookies.txt layout."
         ),
     )
     _add_password_arg(ps)
@@ -482,9 +486,9 @@ def run_interactive() -> int:
             fmt_choice = _ask("Format [1=netscape, 2=json]", default="1")
             fmt = "json" if fmt_choice.strip() in ("2", "json") else "netscape"
             per_src_ans = _ask(
-                "One folder per source/victim? [y/N]", default="n"
+                "One folder per source/victim? [Y/n]", default="y"
             ).lower()
-            per_source = per_src_ans in ("y", "yes", "1", "true")
+            per_source = per_src_ans not in ("n", "no", "0", "false")
             if per_source:
                 out = _ask("Output directory", default="cookies_out")
             else:
