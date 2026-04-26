@@ -22,7 +22,7 @@ from .cookies import (
     to_netscape_line,
 )
 from .extract import expand_input, is_archive
-from .sorter import sort_logs
+from .sorter import _safe_keyword, sort_logs
 from .ulp import collect_credentials
 from .utils import domain_of
 
@@ -192,6 +192,91 @@ def cmd_cookies(args: argparse.Namespace) -> int:
         return 0
 
 
+def _sort_per_source(
+    roots: List[Path], out_dir: Path, keywords: List[str]
+) -> dict:
+    """Per-keyword, per-victim layout::
+
+        out_dir/
+          <keyword>/
+            <victim>/
+              cookies.txt
+              creds.txt
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # stats[k] = {"victims": set, "ulp": int, "cookies": int}
+    stats = {k: {"victims": set(), "ulp": 0, "cookies": 0} for k in keywords}
+    # buffers[(k, src)] = ([ulp_lines], [cookie_lines], dedupe_sets...)
+    ulp_buf: dict = {}
+    seen_ulp: dict = {}
+    cookie_buf: dict = {}
+    seen_cookie: dict = {}
+
+    def _ulp_bucket(k: str, src: str):
+        key = (k, src)
+        ulp_buf.setdefault(key, [])
+        seen_ulp.setdefault(key, set())
+        return ulp_buf[key], seen_ulp[key]
+
+    def _cookie_bucket(k: str, src: str):
+        key = (k, src)
+        cookie_buf.setdefault(key, [])
+        seen_cookie.setdefault(key, set())
+        return cookie_buf[key], seen_cookie[key]
+
+    for r in roots:
+        for url, user, pwd, src_path in collect_credentials(r):
+            host = domain_of(url)
+            haystack = (url + " " + host).lower()
+            src = safe_source_name(source_name_for(src_path, r))
+            line = f"{url}:{user}:{pwd}"
+            for k in keywords:
+                if k.lower() in haystack:
+                    buf, seen = _ulp_bucket(k, src)
+                    if line in seen:
+                        continue
+                    seen.add(line)
+                    buf.append(line)
+                    stats[k]["ulp"] += 1
+                    stats[k]["victims"].add(src)
+
+    for r in roots:
+        for cookie, src_path in collect_cookies_with_source(r):
+            domain = (cookie.get("domain") or "").lower()
+            if not domain:
+                continue
+            src = safe_source_name(source_name_for(src_path, r))
+            line = to_netscape_line(cookie)
+            for k in keywords:
+                if k.lower() in domain:
+                    buf, seen = _cookie_bucket(k, src)
+                    if line in seen:
+                        continue
+                    seen.add(line)
+                    buf.append(line)
+                    stats[k]["cookies"] += 1
+                    stats[k]["victims"].add(src)
+
+    for (k, src), lines in ulp_buf.items():
+        if not lines:
+            continue
+        path = out_dir / _safe_keyword(k) / src / "creds.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    for (k, src), lines in cookie_buf.items():
+        if not lines:
+            continue
+        path = out_dir / _safe_keyword(k) / src / "cookies.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(NETSCAPE_HEADER)
+            for ln in lines:
+                f.write(ln + "\n")
+
+    return stats
+
+
 def cmd_sort(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
         roots, failures = _resolve_roots(stack, args.input, args.password)
@@ -203,6 +288,18 @@ def cmd_sort(args: argparse.Namespace) -> int:
         if not keywords:
             print("provide --keywords", file=sys.stderr)
             return 2
+
+        per_source = getattr(args, "per_source", False)
+        if per_source:
+            stats = _sort_per_source(roots, Path(args.output), keywords)
+            for k, s in stats.items():
+                print(
+                    f"  {k}: {len(s['victims'])} hit(s), {s['ulp']} ulp, "
+                    f"{s['cookies']} cookies",
+                    file=sys.stderr,
+                )
+            return 0
+
         stats = sort_logs(roots, Path(args.output), keywords)
         for k, (u, c) in stats.items():
             print(f"  {k}: {u} ulp, {c} cookies", file=sys.stderr)
@@ -286,6 +383,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--keywords",
         required=True,
         help="comma-separated keywords (e.g. netflix,spotify,roblox)",
+    )
+    ps.add_argument(
+        "--per-source",
+        action="store_true",
+        help=(
+            "instead of one ulp.txt + cookies.txt per keyword, write one "
+            "folder per (keyword, victim) hit: "
+            "<output>/<keyword>/<victim>/cookies.txt + creds.txt"
+        ),
     )
     _add_password_arg(ps)
     ps.set_defaults(func=cmd_sort)
@@ -401,12 +507,18 @@ def run_interactive() -> int:
             keywords = _ask_nonempty(
                 "Keywords to sort by (comma-separated, e.g. netflix,spotify,roblox)"
             )
+            per_src_ans = _ask(
+                "One folder per hit (keyword/victim/cookies.txt)? [Y/n]",
+                default="y",
+            ).lower()
+            per_source = per_src_ans not in ("n", "no", "0", "false")
             out = _ask("Output directory", default="sorted")
             return cmd_sort(
                 _build_args(
                     input=inp,
                     output=out,
                     keywords=keywords,
+                    per_source=per_source,
                     password=passwords,
                 )
             )
