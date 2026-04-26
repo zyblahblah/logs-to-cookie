@@ -12,6 +12,34 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
+## Quick start (no CLI flags)
+
+If you don't want to type flags (e.g. running from a mobile launcher, Termux,
+or just double-clicking the file), just run it with no arguments and it drops
+into an interactive menu:
+
+```
+$ python logs_to_cookie.py
+====================================================
+ logs-to-cookie v0.3.0 — interactive mode
+====================================================
+ 1) ulp      — extract URL:USER:PASS
+ 2) cookies  — build cookies.txt / JSON
+ 3) sort     — bucket by keyword (ULP + cookies per keyword)
+ q) quit
+
+Choose [1/2/3/q] [3]: 3
+Input path (dir, file, or .zip/.rar/.7z): logs.zip
+Archive password(s), comma-separated (leave blank if none): 1234
+Keywords to sort by (comma-separated, e.g. netflix,spotify,roblox): netflix,spotify
+Output directory [sorted]:
+  netflix: 42 ulp, 17 cookies
+  spotify: 12 ulp,  8 cookies
+```
+
+All the same options you'd pass as CLI flags are asked for here; sensible
+defaults are offered in `[brackets]` — just press Enter to accept.
+
 ## Install
 
 No third-party dependencies — Python 3.9+ stdlib only.
