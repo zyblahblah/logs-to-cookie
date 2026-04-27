@@ -16,6 +16,7 @@ Stdlib only, Python 3.9+.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -25,12 +26,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
+
+
+# Re-exposed so old code that did `from urllib.parse import urlparse` keeps
+# working when copy-pasted from this single file.
+urlparse = urllib.parse.urlparse
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -574,18 +583,290 @@ def _open_out(path: str):
     return open(p, "w", encoding="utf-8"), True
 
 
+# ---------------------------------------------------------------------------
+# HTTP stream downloader (range-split parallel + single-stream fallback)
+# ---------------------------------------------------------------------------
+
+_DL_CHUNK = 1024 * 1024
+_DL_TIMEOUT = 60
+_DL_RETRIES = 3
+_DL_USER_AGENT = (
+    f"logs-to-cookie/{__version__} (+https://github.com/zyblahblah/logs-to-cookie)"
+)
+
+
+def is_url(s: str) -> bool:
+    return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
+
+
+def filename_from_url(url: str, fallback: str = "download.bin") -> str:
+    parsed = urllib.parse.urlparse(url)
+    name = Path(urllib.parse.unquote(parsed.path or "")).name
+    return name or fallback
+
+
+def _dl_open(url: str, headers: Optional[dict] = None, timeout: int = _DL_TIMEOUT):
+    h = {"User-Agent": _DL_USER_AGENT}
+    if headers:
+        h.update(headers)
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=h), timeout=timeout
+    )
+
+
+def _dl_probe(url: str, timeout: int = 30) -> Tuple[Optional[int], bool, str]:
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": _DL_USER_AGENT}, method="HEAD"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            length = r.headers.get("Content-Length")
+            ranges = (r.headers.get("Accept-Ranges") or "").lower() == "bytes"
+            return (int(length) if length else None, ranges, r.geturl())
+    except Exception:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": _DL_USER_AGENT, "Range": "bytes=0-0"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                cr = r.headers.get("Content-Range") or ""
+                total = None
+                if "/" in cr:
+                    try:
+                        total = int(cr.rsplit("/", 1)[1])
+                    except ValueError:
+                        total = None
+                return (total, r.status == 206, r.geturl())
+        except Exception:
+            return (None, False, url)
+
+
+class _DLProgress:
+    def __init__(self, label: str, stream=sys.stderr, interval: float = 0.5):
+        self.label = label
+        self.stream = stream
+        self.interval = interval
+        self.last = 0.0
+        self._lock = threading.Lock()
+
+    def __call__(self, done: int, total: int, elapsed: float) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self.last < self.interval and (not total or done < total):
+                return
+            self.last = now
+            mb = done / 1024 / 1024
+            speed = (done / elapsed / 1024 / 1024) if elapsed > 0 else 0.0
+            if total:
+                t_mb = total / 1024 / 1024
+                pct = 100.0 * done / total
+                eta = ((total - done) / (done / elapsed)) if done else 0.0
+                line = (
+                    f"\r{self.label}: {mb:7.1f} / {t_mb:7.1f} MB "
+                    f"({pct:5.1f}%)  {speed:6.2f} MB/s  ETA {int(eta):4d}s"
+                )
+            else:
+                line = f"\r{self.label}: {mb:7.1f} MB  {speed:6.2f} MB/s"
+            self.stream.write(line)
+            self.stream.flush()
+            if total and done >= total:
+                self.stream.write("\n")
+                self.stream.flush()
+
+
+def _dl_stream_to(
+    url: str,
+    dest: Path,
+    chunk: int,
+    on_progress: Optional[Callable[[int, int, float], None]],
+    total: Optional[int],
+) -> None:
+    written = 0
+    start = time.monotonic()
+    with _dl_open(url) as resp:
+        if total is None:
+            length = resp.headers.get("Content-Length")
+            try:
+                total = int(length) if length else None
+            except ValueError:
+                total = None
+        with open(dest, "wb") as f:
+            while True:
+                buf = resp.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                written += len(buf)
+                if on_progress:
+                    on_progress(written, total or 0, time.monotonic() - start)
+
+
+def _dl_part(
+    url: str,
+    dest: Path,
+    start: int,
+    end: int,
+    chunk: int,
+    bump: Callable[[int], None],
+    retries: int,
+) -> None:
+    written = 0
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            req_start = start + written
+            if req_start > end:
+                return
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": _DL_USER_AGENT,
+                    "Range": f"bytes={req_start}-{end}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_DL_TIMEOUT) as resp:
+                with open(dest, "rb+") as f:
+                    f.seek(req_start)
+                    while True:
+                        buf = resp.read(chunk)
+                        if not buf:
+                            break
+                        remaining = end - req_start - written + 1
+                        if len(buf) > remaining:
+                            buf = buf[:remaining]
+                        if not buf:
+                            break
+                        f.write(buf)
+                        written += len(buf)
+                        bump(len(buf))
+            if (start + written - 1) >= end:
+                return
+            last_exc = RuntimeError(
+                f"part {start}-{end}: ended early at {start + written - 1}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(min(2 ** attempt, 15))
+    raise RuntimeError(f"part {start}-{end} failed: {last_exc}")
+
+
+def stream_download(
+    url: str,
+    dest: Path,
+    *,
+    workers: int = 4,
+    chunk: int = _DL_CHUNK,
+    retries: int = _DL_RETRIES,
+    label: str = "Downloading",
+    show_progress: bool = True,
+) -> Path:
+    """Download ``url`` to ``dest`` (range-split parallel + fallback)."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    on_progress = _DLProgress(label) if show_progress else None
+    total, ranges_ok, final_url = _dl_probe(url)
+    use_url = final_url or url
+
+    if not (total and ranges_ok and workers > 1 and total > chunk * 2):
+        if show_progress:
+            print(f"  single-stream: {use_url}", file=sys.stderr)
+        _dl_stream_to(use_url, dest, chunk, on_progress, total)
+        return dest
+
+    with open(dest, "wb") as f:
+        f.truncate(total)
+
+    parts: List[Tuple[int, int]] = []
+    part_size = max(chunk, (total + workers - 1) // workers)
+    pos = 0
+    while pos < total:
+        end = min(pos + part_size, total) - 1
+        parts.append((pos, end))
+        pos = end + 1
+    if show_progress:
+        print(
+            f"  range-split: {len(parts)} parts × {part_size / 1024 / 1024:.1f} MB → {use_url}",
+            file=sys.stderr,
+        )
+
+    bytes_done = [0]
+    bd_lock = threading.Lock()
+    start_t = time.monotonic()
+
+    def bump(n: int) -> None:
+        with bd_lock:
+            bytes_done[0] += n
+            if on_progress:
+                on_progress(bytes_done[0], total, time.monotonic() - start_t)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(_dl_part, use_url, dest, s, e, chunk, bump, retries)
+                for (s, e) in parts
+            ]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+    except Exception:
+        if show_progress:
+            print(
+                "\n  range-split failed → falling back to single stream",
+                file=sys.stderr,
+            )
+        try:
+            dest.unlink(missing_ok=True)
+        except TypeError:
+            if dest.exists():
+                dest.unlink()
+        _dl_stream_to(use_url, dest, chunk, on_progress, total)
+    return dest
+
+
+def download_to_workdir(
+    url: str,
+    workdir: Path,
+    *,
+    workers: int = 4,
+    label_prefix: str = "Downloading",
+) -> Path:
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    name = filename_from_url(url)
+    dest = workdir / name
+    n = 1
+    while dest.exists():
+        dest = workdir / f"{Path(name).stem}_{n}{Path(name).suffix}"
+        n += 1
+    return stream_download(
+        url, dest, workers=workers, label=f"{label_prefix} {name}"
+    )
+
+
 def _resolve_roots(
     stack: contextlib.ExitStack,
     input_path: str,
     passwords: List[str],
+    *,
+    workers: int = 4,
 ) -> Tuple[List[Path], List[Path]]:
-    inp = Path(input_path)
-    if not inp.exists():
-        return [], []
+    workdir: Optional[Path] = None
+    if is_url(input_path):
+        workdir = Path(
+            stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-dl-"))
+        )
+        inp = download_to_workdir(input_path, workdir, workers=workers)
+    else:
+        inp = Path(input_path)
+        if not inp.exists():
+            return [], []
     do_extract = bool(passwords) or (inp.is_file() and is_archive(inp))
     if not do_extract:
         return [inp], []
-    workdir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-")))
+    if workdir is None:
+        workdir = Path(
+            stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-"))
+        )
     inputs: List[Path] = []
     if inp.is_file():
         inputs.append(inp)
@@ -613,7 +894,9 @@ def _report_failures(failures: List[Path]) -> None:
 
 def cmd_ulp(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
-        roots, failures = _resolve_roots(stack, args.input, args.password)
+        roots, failures = _resolve_roots(
+            stack, args.input, args.password, workers=getattr(args, "workers", 4)
+        )
         if not roots and not failures:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
@@ -659,7 +942,9 @@ def _write_cookies_file(path: Path, cookies: List[Dict], fmt: str) -> None:
 
 def cmd_cookies(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
-        roots, failures = _resolve_roots(stack, args.input, args.password)
+        roots, failures = _resolve_roots(
+            stack, args.input, args.password, workers=getattr(args, "workers", 4)
+        )
         if not roots and not failures:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
@@ -797,7 +1082,9 @@ def _sort_per_source(
 
 def cmd_sort(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
-        roots, failures = _resolve_roots(stack, args.input, args.password)
+        roots, failures = _resolve_roots(
+            stack, args.input, args.password, workers=getattr(args, "workers", 4)
+        )
         if not roots and not failures:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
@@ -833,6 +1120,15 @@ def _add_password_arg(parser: argparse.ArgumentParser) -> None:
             "Password for archived logs (.zip/.rar/.7z). May be repeated to "
             "try several. Without --password, archives in the input are left "
             "untouched."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help=(
+            "Parallel range-split download workers when input is an HTTP(S) "
+            "URL. Default 4. Set to 1 to force a single stream."
         ),
     )
 
@@ -937,6 +1233,18 @@ def _ask(prompt: str, default: Optional[str] = None) -> str:
     return answer
 
 
+def _ask_workers(inp: str) -> int:
+    if not is_url(inp):
+        return 4
+    raw = _ask(
+        "Parallel download workers for URL (1 = single stream)", default="4"
+    )
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 4
+
+
 def _ask_passwords() -> List[str]:
     raw = _ask(
         "Archive password(s), comma-separated (leave blank if none)", default=""
@@ -987,8 +1295,9 @@ def run_interactive() -> int:
 
     try:
         if choice in ("1", "ulp"):
-            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
+            workers = _ask_workers(inp)
             filt = _ask("Filter keywords (substring, comma-separated; blank=all)", default="")
             out = _ask("Output file (- for stdout)", default="creds.ulp.txt")
             return cmd_ulp(
@@ -998,12 +1307,14 @@ def run_interactive() -> int:
                     filter=filt or None,
                     no_dedupe=False,
                     password=passwords,
+                    workers=workers,
                 )
             )
 
         if choice in ("2", "cookies"):
-            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
+            workers = _ask_workers(inp)
             filt = _ask(
                 "Filter keywords (cookie domain substring; blank=all)", default=""
             )
@@ -1026,12 +1337,14 @@ def run_interactive() -> int:
                     filter=filt or None,
                     per_source=per_source,
                     password=passwords,
+                    workers=workers,
                 )
             )
 
         if choice in ("3", "sort"):
-            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
+            workers = _ask_workers(inp)
             keywords = _ask_nonempty(
                 "Keywords to sort by (comma-separated, e.g. netflix,spotify,roblox)"
             )
@@ -1048,6 +1361,7 @@ def run_interactive() -> int:
                     keywords=keywords,
                     per_source=per_source,
                     password=passwords,
+                    workers=workers,
                 )
             )
     except KeyboardInterrupt:

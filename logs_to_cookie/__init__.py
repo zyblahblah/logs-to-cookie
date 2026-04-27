@@ -1,3 +1,3 @@
 """logs-to-cookie: sort/convert stealer-style logs to ULP and cookie formats."""
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
