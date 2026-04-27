@@ -12,6 +12,30 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
+## Direct download: hand it a URL
+
+Every command (`ulp`, `cookies`, `sort`) accepts an HTTP(S) direct-download
+URL in place of a local path or archive. The host downloads the file via a
+range-split parallel streamer (and falls back to a single stream if the
+server doesn't advertise `Accept-Ranges`), so multi-GB archives can be
+processed without first saving them to your phone:
+
+```
+python logs_to_cookie.py sort \
+    "https://example.com/Black%20Logs.zip" \
+    --password "$PW" --keywords netflix,claude --workers 8 -o sorted/
+```
+
+In interactive mode, paste the URL at the *"Input path or http(s) URL"*
+prompt and you'll be asked how many parallel workers to use (default 4,
+set to 1 to force a single stream). The downloaded file lives in a temp
+directory that is deleted as soon as processing finishes, so it doesn't
+clutter device storage.
+
+The downloader is stdlib-only (`urllib` + a small thread pool), patterned
+after the streaming engine in
+[`zyblahblah/zyblahblah-ulp-to-combo`](https://github.com/zyblahblah/zyblahblah-ulp-to-combo).
+
 ## Sort: per-victim folder, one Netscape file per source cookie file (default)
 
 This is the most common workflow when the input is a stealer dump containing

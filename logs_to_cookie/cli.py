@@ -22,6 +22,7 @@ from .cookies import (
     source_name_for,
     to_netscape_line,
 )
+from .download import download_to_workdir, is_url
 from .extract import expand_input, is_archive
 from .sorter import sort_logs
 from .ulp import collect_credentials
@@ -41,23 +42,41 @@ def _resolve_roots(
     stack: contextlib.ExitStack,
     input_path: str,
     passwords: List[str],
+    *,
+    workers: int = 4,
 ) -> Tuple[List[Path], List[Path]]:
     """Resolve ``input_path`` into a list of roots, extracting archives.
+
+    If ``input_path`` is an HTTP(S) URL, the file is first stream-downloaded
+    into a temporary working directory (range-split parallel when the host
+    supports ``Accept-Ranges``, single-stream fallback otherwise) and then
+    treated like a local file.
 
     Extraction is triggered if any password is supplied or the input itself
     is an archive file. Archives encountered (top level and nested) are
     extracted into a temporary working directory using each password in
     turn. Returns ``(roots, failures)``.
     """
-    inp = Path(input_path)
-    if not inp.exists():
-        return [], []
+    workdir: Optional[Path] = None
+    if is_url(input_path):
+        workdir = Path(
+            stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-dl-"))
+        )
+        downloaded = download_to_workdir(input_path, workdir, workers=workers)
+        inp = downloaded
+    else:
+        inp = Path(input_path)
+        if not inp.exists():
+            return [], []
 
     do_extract = bool(passwords) or (inp.is_file() and is_archive(inp))
     if not do_extract:
         return [inp], []
 
-    workdir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-")))
+    if workdir is None:
+        workdir = Path(
+            stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-"))
+        )
 
     inputs: List[Path] = []
     if inp.is_file():
@@ -89,7 +108,9 @@ def _report_failures(failures: List[Path]) -> None:
 
 def cmd_ulp(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
-        roots, failures = _resolve_roots(stack, args.input, args.password)
+        roots, failures = _resolve_roots(
+            stack, args.input, args.password, workers=getattr(args, "workers", 4)
+        )
         if not roots and not failures:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
@@ -135,7 +156,9 @@ def _write_cookies_file(path: Path, cookies: List[dict], fmt: str) -> None:
 
 def cmd_cookies(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
-        roots, failures = _resolve_roots(stack, args.input, args.password)
+        roots, failures = _resolve_roots(
+            stack, args.input, args.password, workers=getattr(args, "workers", 4)
+        )
         if not roots and not failures:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
@@ -283,7 +306,9 @@ def _sort_per_source(
 
 def cmd_sort(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
-        roots, failures = _resolve_roots(stack, args.input, args.password)
+        roots, failures = _resolve_roots(
+            stack, args.input, args.password, workers=getattr(args, "workers", 4)
+        )
         if not roots and not failures:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
@@ -319,6 +344,15 @@ def _add_password_arg(parser: argparse.ArgumentParser) -> None:
             "Password for archived logs (.zip/.rar/.7z). May be repeated to "
             "try several. Without --password, archives in the input are left "
             "untouched."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help=(
+            "Parallel range-split download workers when input is an HTTP(S) "
+            "URL. Default 4. Set to 1 to force a single stream."
         ),
     )
 
@@ -419,6 +453,19 @@ def _ask(prompt: str, default: Optional[str] = None) -> str:
     return answer
 
 
+def _ask_workers(inp: str) -> int:
+    if not is_url(inp):
+        return 4
+    raw = _ask(
+        "Parallel download workers for URL (1 = single stream)", default="4"
+    )
+    try:
+        n = int(raw)
+        return max(1, n)
+    except ValueError:
+        return 4
+
+
 def _ask_passwords() -> List[str]:
     raw = _ask(
         "Archive password(s), comma-separated (leave blank if none)", default=""
@@ -465,8 +512,9 @@ def run_interactive() -> int:
 
     try:
         if choice in ("1", "ulp"):
-            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
+            workers = _ask_workers(inp)
             filt = _ask(
                 "Filter keywords (substring, comma-separated; blank=all)",
                 default="",
@@ -479,12 +527,14 @@ def run_interactive() -> int:
                     filter=filt or None,
                     no_dedupe=False,
                     password=passwords,
+                    workers=workers,
                 )
             )
 
         if choice in ("2", "cookies"):
-            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
+            workers = _ask_workers(inp)
             filt = _ask(
                 "Filter keywords (cookie domain substring; blank=all)", default=""
             )
@@ -507,12 +557,14 @@ def run_interactive() -> int:
                     filter=filt or None,
                     per_source=per_source,
                     password=passwords,
+                    workers=workers,
                 )
             )
 
         if choice in ("3", "sort"):
-            inp = _ask_nonempty("Input path (dir, file, or .zip/.rar/.7z)")
+            inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
+            workers = _ask_workers(inp)
             keywords = _ask_nonempty(
                 "Keywords to sort by (comma-separated, e.g. netflix,spotify,roblox)"
             )
@@ -529,6 +581,7 @@ def run_interactive() -> int:
                     keywords=keywords,
                     per_source=per_source,
                     password=passwords,
+                    workers=workers,
                 )
             )
     except KeyboardInterrupt:
