@@ -155,6 +155,86 @@ def test_download_to_workdir_picks_filename(big_blob: Path, tmp_path: Path):
     assert dest.read_bytes() == big_blob.read_bytes()
 
 
+def test_part_retry_resumes_correctly(tmp_path: Path):
+    """Regression: retry path must not double-count `written`.
+
+    First attempt for the second range-part returns *short* (truncates the
+    response mid-part). The downloader should retry, ask for the remainder,
+    and end up writing the full byte range — without the `remaining` boundary
+    check zeroing out the buffer. With the old formula the retry would write
+    nothing and the part would fail.
+    """
+    blob = tmp_path / "blob.bin"
+    # > 2 × DEFAULT_CHUNK so range-split actually triggers (3 MiB).
+    payload = (bytes(range(256)) * (4 * 1024)) * 3
+    blob.write_bytes(payload)
+    out = tmp_path / "out.bin"
+
+    # State shared between threads: each part is identified by its `end`
+    # (which stays constant across retries even though `start` shifts forward
+    # as bytes are received). Sabotage only the first attempt for each part.
+    sabotaged_ends: set = set()
+    sabotage_lock = threading.Lock()
+
+    class _FlakyHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", str(blob.stat().st_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+
+        def do_GET(self):  # noqa: N802
+            size = blob.stat().st_size
+            rng = self.headers.get("Range") or ""
+            if not rng.startswith("bytes="):
+                self.send_error(500)
+                return
+            s, e = rng[6:].split("-", 1)
+            start = int(s) if s else 0
+            end = int(e) if e else size - 1
+            end = min(end, size - 1)
+            length = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            with sabotage_lock:
+                sabotage_first = end not in sabotaged_ends
+                sabotaged_ends.add(end)
+            with open(blob, "rb") as fh:
+                fh.seek(start)
+                if sabotage_first and length > 1024:
+                    # Send only the first 256 bytes then drop the connection.
+                    self.wfile.write(fh.read(256))
+                    try:
+                        self.wfile.flush()
+                    finally:
+                        self.connection.close()
+                    return
+                remaining = length
+                while remaining > 0:
+                    buf = fh.read(min(64 * 1024, remaining))
+                    if not buf:
+                        break
+                    self.wfile.write(buf)
+                    remaining -= len(buf)
+
+        def log_message(self, *_a, **_kw):
+            return
+
+    srv = _ThreadedServer(("127.0.0.1", 0), _FlakyHandler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{port}/blob.bin"
+        stream_download(url, out, workers=4, show_progress=False)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert out.read_bytes() == payload
+
+
 def test_resolve_roots_downloads_url(big_blob: Path, tmp_path: Path):
     """`_resolve_roots` should transparently download URL inputs."""
     import zipfile

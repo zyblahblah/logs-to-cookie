@@ -732,7 +732,12 @@ def _dl_part(
                         buf = resp.read(chunk)
                         if not buf:
                             break
-                        remaining = end - req_start - written + 1
+                        # ``written`` is the cumulative bytes for this part
+                        # across all attempts, so the remaining-bytes formula
+                        # must be relative to ``start`` (not ``req_start``,
+                        # which already includes the previously-written count
+                        # at attempt entry).
+                        remaining = end - start - written + 1
                         if len(buf) > remaining:
                             buf = buf[:remaining]
                         if not buf:

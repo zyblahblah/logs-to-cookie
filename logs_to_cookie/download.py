@@ -186,8 +186,12 @@ def _download_part(
                         buf = resp.read(chunk)
                         if not buf:
                             break
-                        # Respect the part boundary just in case.
-                        remaining = end - req_start - written + 1
+                        # Respect the part boundary. ``written`` is the total
+                        # bytes successfully written for this part across all
+                        # attempts so far (including the current one), so the
+                        # formula must be relative to ``start``, not to
+                        # ``req_start = start + written_at_attempt_entry``.
+                        remaining = end - start - written + 1
                         if len(buf) > remaining:
                             buf = buf[:remaining]
                         if not buf:
