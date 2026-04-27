@@ -359,3 +359,59 @@ def test_progress_block_lines_track_actual_count():
     # The cursor-up escape between blocks must reference 5, not 6.
     assert "\x1b[5A\x1b[J" in out, out
     assert "\x1b[6A\x1b[J" not in out, out
+
+
+def test_stream_download_rejects_truncated_file(tmp_path):
+    """If the server advertises Content-Length but delivers fewer bytes
+    (truncated download, redirected to error page, etc.) `stream_download`
+    must raise instead of silently returning a short file. Otherwise the
+    bot's downstream extraction surfaces a misleading 'wrong password'
+    error and the user has no way to know the file is incomplete.
+    """
+    import http.server
+    import threading
+    import socketserver
+    from logs_to_cookie.download import stream_download
+
+    # 100 MB advertised, only 1 MB delivered.
+    advertised = 100 * 1024 * 1024
+    delivered = 1024 * 1024
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(advertised))
+            self.send_header("Accept-Ranges", "none")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(advertised))
+            self.send_header("Accept-Ranges", "none")
+            self.end_headers()
+            self.wfile.write(b"x" * delivered)
+            # Connection closed early — short read.
+
+        def log_message(self, *a, **k):
+            pass
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _Handler) as srv:
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            dest = tmp_path / "blob.bin"
+            try:
+                stream_download(
+                    f"http://127.0.0.1:{port}/blob.bin",
+                    dest,
+                    workers=1,
+                    show_progress=False,
+                )
+            except RuntimeError as exc:
+                msg = str(exc)
+                assert "size mismatch" in msg or "incomplete" in msg, msg
+            else:
+                raise AssertionError("expected RuntimeError on size mismatch")
+        finally:
+            srv.shutdown()

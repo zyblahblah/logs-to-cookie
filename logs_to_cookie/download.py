@@ -421,6 +421,20 @@ def _download_part(
             }
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                # If the server returned a 200 instead of 206, it is
+                # silently ignoring our Range header and would dump the
+                # entire file into our part offset — every part would
+                # write the *first* (end-start+1) bytes of the file
+                # into its own offset, producing a corrupted output
+                # that "downloads" suspiciously fast and then fails
+                # extraction with a generic "wrong password / missing
+                # tool" error. Bail to the single-stream fallback.
+                status = getattr(resp, "status", None) or resp.getcode()
+                if status != 206:
+                    raise RuntimeError(
+                        f"server ignored Range (HTTP {status}); "
+                        f"part {start}-{end} cannot be safely written"
+                    )
                 with open(dest, "rb+") as f:
                     f.seek(req_start)
                     while True:
@@ -488,6 +502,7 @@ def stream_download(
             on_progress=on_progress,
             total=total,
         )
+        _check_final_size(dest, total)
         return dest
 
     # Pre-allocate the destination file.
@@ -561,7 +576,29 @@ def stream_download(
             total=total,
         )
 
+    _check_final_size(dest, total)
     return dest
+
+
+def _check_final_size(dest: Path, total: Optional[int]) -> None:
+    """Raise if the on-disk file size doesn't match the advertised length.
+
+    A size mismatch means the download was truncated (server closed
+    early, response was actually an HTML error page, range-split
+    corrupted the file, etc.) and any downstream extraction will fail
+    with a misleading "wrong password / missing tool" error.
+    """
+    if total is None:
+        return
+    actual = dest.stat().st_size
+    if actual != total:
+        raise RuntimeError(
+            f"downloaded size mismatch: expected {total} bytes "
+            f"({_fmt_size(total)}), got {actual} bytes "
+            f"({_fmt_size(actual)}) — file is incomplete or corrupted; "
+            "check the source URL is a direct download and not a "
+            "redirect / preview page"
+        )
 
 
 def download_to_workdir(
