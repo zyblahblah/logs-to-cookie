@@ -238,7 +238,19 @@ class _ProgressMessage:
     single live tile.
     """
 
-    MIN_INTERVAL = 2.0  # seconds between edits — Telegram rate-limits hard
+    # Lower bound between two real edits sent to Telegram. Telegram
+    # rate-limits message edits at ~1/s/chat; 2s gives us plenty of
+    # headroom.
+    MIN_INTERVAL = 2.0
+    # Debounce window: we wait this long after the most recent push
+    # before sending the edit. The CLI emits a 6-line status block as
+    # one ``stream.write`` + ``flush``, but each line lands as a
+    # separate ``push()`` here. Without the debounce the very first
+    # line of the block would render alone (because ``MIN_INTERVAL``
+    # had already elapsed since the last edit) and the remaining 5
+    # lines would all be throttled out — exactly the
+    # ``🌀 Status: Downloading...`` (and nothing else) symptom.
+    DEBOUNCE = 0.4
     BLOCK_MARKER = "🌀 Status:"
     MAX_BLOCK_LINES = 8
     MAX_FALLBACK_LINES = 12
@@ -250,6 +262,7 @@ class _ProgressMessage:
         self._tail: List[str] = []
         self._in_block = False
         self._lock = asyncio.Lock()
+        self._render_task: Optional[asyncio.Task] = None
 
     async def push(self, line: str) -> None:
         line = line.rstrip()
@@ -265,14 +278,31 @@ class _ProgressMessage:
         else:
             self._tail.append(line)
             self._tail = self._tail[-self.MAX_FALLBACK_LINES :]
-        now = time.monotonic()
-        if now - self._last < self.MIN_INTERVAL:
+        # Debounce: cancel any in-flight scheduled render and queue a
+        # new one. Bursts of pushes (a full block) coalesce into a
+        # single Telegram edit.
+        if self._render_task and not self._render_task.done():
+            self._render_task.cancel()
+        self._render_task = asyncio.create_task(self._debounced_render())
+
+    async def _debounced_render(self) -> None:
+        try:
+            await asyncio.sleep(self.DEBOUNCE)
+            now = time.monotonic()
+            wait = self.MIN_INTERVAL - (now - self._last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+        except asyncio.CancelledError:
             return
-        self._last = now
+        self._last = time.monotonic()
         async with self._lock:
             await self._render()
 
     async def finish(self, footer: str = "") -> None:
+        # Flush any pending debounced render so the final tile reflects
+        # the very last block emitted by the worker.
+        if self._render_task and not self._render_task.done():
+            self._render_task.cancel()
         async with self._lock:
             await self._render(footer)
 
