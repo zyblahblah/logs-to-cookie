@@ -22,7 +22,7 @@ from .cookies import (
     source_name_for,
     to_netscape_line,
 )
-from .download import download_to_workdir, is_url
+from .download import download_to_workdir, emit_status, is_url
 from .extract import expand_input, is_archive
 from .sorter import sort_logs
 from .ulp import collect_credentials
@@ -89,6 +89,7 @@ def _resolve_roots(
             if child.is_file() and is_archive(child):
                 inputs.append(child)
 
+    emit_status("Extracting archive...", inp.name if inp.is_file() else inp.name)
     return expand_input(inputs, passwords, workdir)
 
 
@@ -329,6 +330,7 @@ def cmd_sort(args: argparse.Namespace) -> int:
             )
             return 0
 
+        emit_status("Sorting logs...", ", ".join(keywords))
         stats = sort_logs(roots, Path(args.output), keywords)
         for k, (u, c) in stats.items():
             print(f"  {k}: {u} ulp, {c} cookies", file=sys.stderr)

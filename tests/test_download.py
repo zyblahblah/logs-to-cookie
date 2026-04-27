@@ -255,3 +255,107 @@ def test_resolve_roots_downloads_url(big_blob: Path, tmp_path: Path):
         # The downloaded zip should have been auto-extracted because zip is an archive.
         cookie_files = list(roots[0].rglob("*.txt"))
         assert any("netflix.com" in p.read_text() for p in cookie_files)
+
+
+def test_resume_does_not_corrupt_when_total_unknown(tmp_path, monkeypatch):
+    """If a download attempt partially writes data and then raises while
+    ``total`` is unknown, the retry must NOT append a fresh full-file
+    GET on top of the partial bytes (which would corrupt the output as
+    ``[partial][full_file]``).
+
+    Exercises the ``_stream_with_resume`` retry path directly because
+    most servers signal end-of-body via connection close, which urllib's
+    chunked ``read(n)`` swallows silently — so producing the bug via a
+    real socket is unreliable.
+    """
+    from logs_to_cookie import download as dl
+
+    payload = b"Y" * 4096
+    calls = {"n": 0}
+
+    def fake_stream_to(url, dest, *, headers=None, chunk=0, on_progress=None,
+                      bytes_done_offset=0, total=None, append=False):
+        # First attempt: write half of payload, then raise.
+        # Second attempt: must start fresh (append=False) because total is
+        # unknown — write the whole payload.
+        calls["n"] += 1
+        mode = "ab" if append else "wb"
+        if calls["n"] == 1:
+            assert append is False  # first attempt, file is empty
+            with open(dest, mode) as f:
+                f.write(payload[: len(payload) // 2])
+            raise OSError("simulated network drop")
+        # Second attempt — bug would have set append=True here.
+        assert append is False, (
+            "retry must NOT append when total is unknown — would corrupt"
+        )
+        with open(dest, mode) as f:
+            f.write(payload)
+
+    monkeypatch.setattr(dl, "_stream_to", fake_stream_to)
+
+    out = tmp_path / "blob.bin"
+    dl._stream_with_resume(
+        "http://example/x",
+        out,
+        chunk=1024,
+        retries=3,
+        on_progress=None,
+        total=None,
+    )
+    assert out.read_bytes() == payload, (
+        "output corrupted — got partial bytes prepended to a fresh full "
+        "download"
+    )
+
+
+def test_progress_uses_real_elapsed_after_resume():
+    """`_ProgressPrinter` must compute elapsed from its own monotonic
+    origin, not the caller's per-attempt timer. Otherwise after a
+    resume the speed/ETA would be computed against just the current
+    attempt's seconds while ``done`` includes bytes from prior
+    attempts — producing wildly inflated speed numbers.
+    """
+    import io
+    import time as _t
+    from logs_to_cookie.download import _ProgressPrinter
+
+    stream = io.StringIO()
+    p = _ProgressPrinter("blob.bin", stream=stream, interval=0)
+    # Backdate the printer's start by 10 seconds (simulates: a prior
+    # attempt downloaded 5 MB, then we retry and the caller passes
+    # elapsed=0.001 because the new attempt just started).
+    p.start = _t.monotonic() - 10.0
+    p(done=5 * 1024 * 1024, total=10 * 1024 * 1024, elapsed=0.001)
+
+    out = stream.getvalue()
+    # If we used the caller's elapsed=0.001, speed would be ~5000 MB/s.
+    # With the real elapsed (~10s), it's ~0.5 MB/s.
+    import re
+    m = re.search(r"Speed: ([\d.]+) MB/s", out)
+    assert m, out
+    speed = float(m.group(1))
+    assert speed < 5.0, (
+        f"speed {speed} MB/s is implausibly high — "
+        "elapsed timer is using caller's per-attempt value"
+    )
+
+
+def test_progress_block_lines_track_actual_count():
+    """Unknown-total branch emits a 5-line block; known-total emits 6.
+    The redraw must use the previous block's actual line count so it
+    doesn't erase real output above when total flips.
+    """
+    import io
+    from logs_to_cookie.download import _ProgressPrinter
+
+    stream = io.StringIO()
+    stream.isatty = lambda: True  # type: ignore[attr-defined]
+    p = _ProgressPrinter("blob.bin", stream=stream, interval=0)
+    p(done=1024, total=0, elapsed=1.0)  # unknown total → 5 lines
+    p(done=2048, total=0, elapsed=2.0)  # second draw should erase 5
+
+    out = stream.getvalue()
+    # The cursor-up escape between blocks must reference 5, not 6.
+    assert "\x1b[5A\x1b[J" in out, out
+    assert "\x1b[6A\x1b[J" not in out, out
