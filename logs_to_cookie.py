@@ -924,6 +924,17 @@ def _dl_part(
                 },
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                # Server must return 206 (Partial Content). A 200
+                # response means it's silently ignoring our Range
+                # header and would dump the whole file at our part
+                # offset — corrupting the result and making the
+                # download appear suspiciously fast.
+                status = getattr(resp, "status", None) or resp.getcode()
+                if status != 206:
+                    raise RuntimeError(
+                        f"server ignored Range (HTTP {status}); "
+                        f"part {start}-{end} cannot be safely written"
+                    )
                 with open(dest, "rb+") as f:
                     f.seek(req_start)
                     while True:
@@ -978,6 +989,7 @@ def stream_download(
         if show_progress:
             print(f"  single-stream: {use_url}", file=sys.stderr, flush=True)
         _dl_stream_with_resume(use_url, dest, chunk, retries, on_progress, total)
+        _dl_check_final_size(dest, total)
         return dest
 
     with open(dest, "wb") as f:
@@ -1031,7 +1043,24 @@ def stream_download(
             if dest.exists():
                 dest.unlink()
         _dl_stream_with_resume(use_url, dest, chunk, retries, on_progress, total)
+
+    _dl_check_final_size(dest, total)
     return dest
+
+
+def _dl_check_final_size(dest: Path, total: Optional[int]) -> None:
+    """Raise if the on-disk file size doesn't match the advertised length."""
+    if total is None:
+        return
+    actual = dest.stat().st_size
+    if actual != total:
+        raise RuntimeError(
+            f"downloaded size mismatch: expected {total} bytes "
+            f"({_dl_fmt_size(total)}), got {actual} bytes "
+            f"({_dl_fmt_size(actual)}) — file is incomplete or corrupted; "
+            "check the source URL is a direct download and not a "
+            "redirect / preview page"
+        )
 
 
 def download_to_workdir(
