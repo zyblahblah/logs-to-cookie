@@ -168,6 +168,14 @@ async def cmd_ulp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     pwd = (update.message.text or "").strip()
+    # Guard: if user accidentally sends a /command here, treat it as cancel
+    # rather than using the command text as the archive password.
+    if pwd.startswith("/"):
+        await update.message.reply_text(
+            "Cancelled. Send the command again with the URL."
+        )
+        ctx.user_data.clear()
+        return ConversationHandler.END
     # BUG FIX: Added "no" and "nil" to the list of words that mean
     # "no password".  Previously typing "no" stored it as the literal
     # archive password and made every subsequent extraction fail.
@@ -186,6 +194,16 @@ async def on_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     keywords = (update.message.text or "").strip()
+    # Guard: if user accidentally sends a /command here, treat it as cancel
+    # rather than using the command text as the keyword string. Mirrors the
+    # check in on_password so /cancel (and other commands) keep working while
+    # this state uses filters.TEXT (which would otherwise swallow commands).
+    if keywords.startswith("/"):
+        await update.message.reply_text(
+            "Cancelled. Send the command again with the URL."
+        )
+        ctx.user_data.clear()
+        return ConversationHandler.END
     if not keywords:
         await update.message.reply_text("Keywords are required for `/sort`.")
         return ASK_KEYWORDS
@@ -645,9 +663,17 @@ def build_application() -> Application:
             MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_url),
         ],
         states={
-            ASK_PWD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_password)],
+            # BUG FIX: Use filters.TEXT only (drop ~filters.COMMAND) so that
+            # messages Telegram marks as "mention" entities (e.g. @SomeName)
+            # are still delivered to on_password. Telegram attaches a
+            # ``mention`` entity to any @word, which does NOT make the message
+            # a command — but the previous filter was broad enough that some
+            # PTB builds routed mention-text away from this handler.
+            # We still exclude actual /commands via a manual check inside
+            # on_password so /cancel still works as a fallback.
+            ASK_PWD: [MessageHandler(filters.TEXT, on_password)],
             ASK_KEYWORDS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_keywords)
+                MessageHandler(filters.TEXT, on_keywords)
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
