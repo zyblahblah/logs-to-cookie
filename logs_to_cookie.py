@@ -795,9 +795,20 @@ def _dl_stream_with_resume(
             already = dest.stat().st_size if dest.exists() else 0
             if total is not None and already >= total > 0:
                 return
+            # Only resume via append when we can actually send a Range
+            # request. Without ``total`` we have no way to skip bytes
+            # server-side, so falling back to a full-file GET would
+            # otherwise corrupt the output by appending on top of the
+            # partial bytes.
             headers = (
                 {"Range": f"bytes={already}-"} if already and total else None
             )
+            if already and not headers:
+                try:
+                    dest.unlink()
+                except FileNotFoundError:
+                    pass
+                already = 0
             _dl_stream_to(
                 url,
                 dest,
@@ -806,11 +817,13 @@ def _dl_stream_with_resume(
                 (total - already) if (total and headers) else total,
                 headers=headers,
                 bytes_done_offset=already,
-                append=bool(already),
+                append=bool(headers),
             )
             return
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            if attempt >= retries:
+                break
             backoff = min(2 ** attempt, 30)
             print(
                 f"\n  single-stream attempt {attempt + 1} failed ({exc!r}); "
@@ -873,6 +886,8 @@ def _dl_part(
             )
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+        if attempt >= retries:
+            break
         time.sleep(min(2 ** attempt, 30))
     raise RuntimeError(f"part {start}-{end} failed: {last_exc}")
 

@@ -274,9 +274,21 @@ def _stream_with_resume(
             already = dest.stat().st_size if dest.exists() else 0
             if total is not None and already >= total > 0:
                 return
+            # Only resume via append when we can actually send a Range
+            # request. Without ``total`` (server didn't advertise length)
+            # we have no reliable way to ask the server to skip bytes, so
+            # falling back to a fresh full-file GET would otherwise be
+            # appended on top of the partial bytes — corrupting output.
             headers = (
                 {"Range": f"bytes={already}-"} if already and total else None
             )
+            if already and not headers:
+                # Can't resume safely; truncate and start over.
+                try:
+                    dest.unlink()
+                except FileNotFoundError:
+                    pass
+                already = 0
             _stream_to(
                 url,
                 dest,
@@ -285,11 +297,13 @@ def _stream_with_resume(
                 on_progress=on_progress,
                 bytes_done_offset=already,
                 total=(total - already) if (total and headers) else total,
-                append=bool(already),
+                append=bool(headers),
             )
             return
         except Exception as exc:  # noqa: BLE001 — we want to retry every IO error
             last_exc = exc
+            if attempt >= retries:
+                break
             backoff = min(2 ** attempt, 30)
             print(
                 f"\n  single-stream attempt {attempt + 1} failed ({exc!r}); "
@@ -356,8 +370,9 @@ def _download_part(
             )
         except Exception as exc:  # noqa: BLE001 — retry every IO error
             last_exc = exc
-        backoff = min(2 ** attempt, 30)
-        time.sleep(backoff)
+        if attempt >= retries:
+            break
+        time.sleep(min(2 ** attempt, 30))
     raise RuntimeError(
         f"part {start}-{end} failed after {retries} retries: {last_exc}"
     )

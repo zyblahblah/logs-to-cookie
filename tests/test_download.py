@@ -255,3 +255,55 @@ def test_resolve_roots_downloads_url(big_blob: Path, tmp_path: Path):
         # The downloaded zip should have been auto-extracted because zip is an archive.
         cookie_files = list(roots[0].rglob("*.txt"))
         assert any("netflix.com" in p.read_text() for p in cookie_files)
+
+
+def test_resume_does_not_corrupt_when_total_unknown(tmp_path, monkeypatch):
+    """If a download attempt partially writes data and then raises while
+    ``total`` is unknown, the retry must NOT append a fresh full-file
+    GET on top of the partial bytes (which would corrupt the output as
+    ``[partial][full_file]``).
+
+    Exercises the ``_stream_with_resume`` retry path directly because
+    most servers signal end-of-body via connection close, which urllib's
+    chunked ``read(n)`` swallows silently — so producing the bug via a
+    real socket is unreliable.
+    """
+    from logs_to_cookie import download as dl
+
+    payload = b"Y" * 4096
+    calls = {"n": 0}
+
+    def fake_stream_to(url, dest, *, headers=None, chunk=0, on_progress=None,
+                      bytes_done_offset=0, total=None, append=False):
+        # First attempt: write half of payload, then raise.
+        # Second attempt: must start fresh (append=False) because total is
+        # unknown — write the whole payload.
+        calls["n"] += 1
+        mode = "ab" if append else "wb"
+        if calls["n"] == 1:
+            assert append is False  # first attempt, file is empty
+            with open(dest, mode) as f:
+                f.write(payload[: len(payload) // 2])
+            raise OSError("simulated network drop")
+        # Second attempt — bug would have set append=True here.
+        assert append is False, (
+            "retry must NOT append when total is unknown — would corrupt"
+        )
+        with open(dest, mode) as f:
+            f.write(payload)
+
+    monkeypatch.setattr(dl, "_stream_to", fake_stream_to)
+
+    out = tmp_path / "blob.bin"
+    dl._stream_with_resume(
+        "http://example/x",
+        out,
+        chunk=1024,
+        retries=3,
+        on_progress=None,
+        total=None,
+    )
+    assert out.read_bytes() == payload, (
+        "output corrupted — got partial bytes prepended to a fresh full "
+        "download"
+    )
