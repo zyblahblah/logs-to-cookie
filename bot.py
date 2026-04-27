@@ -167,18 +167,21 @@ async def cmd_ulp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    pwd = (update.message.text or "").strip()
-    # Guard: if user accidentally sends a /command here, treat it as cancel
-    # rather than using the command text as the archive password.
+    # filters.ALL is used for this state so @mention passwords are delivered.
+    # Guard against non-text messages (stickers, photos, etc.).
+    if not update.message or not update.message.text:
+        await update.message.reply_text(
+            "Please send the password as a text message."
+        )
+        return ASK_PWD
+    pwd = update.message.text.strip()
+    # Guard: if user accidentally sends a /command here, treat it as cancel.
     if pwd.startswith("/"):
         await update.message.reply_text(
             "Cancelled. Send the command again with the URL."
         )
         ctx.user_data.clear()
         return ConversationHandler.END
-    # BUG FIX: Added "no" and "nil" to the list of words that mean
-    # "no password".  Previously typing "no" stored it as the literal
-    # archive password and made every subsequent extraction fail.
     ctx.user_data["job_passwords"] = (
         [] if pwd.lower() in ("", "none", "no", "nil", "n/a", "-") else [pwd]
     )
@@ -194,16 +197,6 @@ async def on_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     keywords = (update.message.text or "").strip()
-    # Guard: if user accidentally sends a /command here, treat it as cancel
-    # rather than using the command text as the keyword string. Mirrors the
-    # check in on_password so /cancel (and other commands) keep working while
-    # this state uses filters.TEXT (which would otherwise swallow commands).
-    if keywords.startswith("/"):
-        await update.message.reply_text(
-            "Cancelled. Send the command again with the URL."
-        )
-        ctx.user_data.clear()
-        return ConversationHandler.END
     if not keywords:
         await update.message.reply_text("Keywords are required for `/sort`.")
         return ASK_KEYWORDS
@@ -552,8 +545,18 @@ async def _run_job(
             await prog.finish(f"Job failed (exit {rc}).")
             return ConversationHandler.END
 
-        if not out_dir.exists():
-            await prog.finish("No output produced.")
+        if not out_dir.exists() or not any(out_dir.rglob("*")):
+            pwd_hint = (
+                f" (tried password: `{passwords[0]}`)" if passwords else " (no password)"
+            )
+            await prog.finish(
+                f"❌ No output produced{pwd_hint}.\n\n"
+                "Possible causes:\n"
+                "• Wrong archive password\n"
+                "• Archive is empty or unsupported format\n"
+                "• No matching credentials/cookies found\n\n"
+                "Start over with /sort, /cookies, or /ulp and supply the correct password."
+            )
             return ConversationHandler.END
 
         zip_path = work / f"{cmd}-result.zip"
@@ -663,15 +666,13 @@ def build_application() -> Application:
             MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_url),
         ],
         states={
-            # BUG FIX: Use filters.TEXT only (drop ~filters.COMMAND) so that
-            # messages Telegram marks as "mention" entities (e.g. @SomeName)
-            # are still delivered to on_password. Telegram attaches a
-            # ``mention`` entity to any @word, which does NOT make the message
-            # a command — but the previous filter was broad enough that some
-            # PTB builds routed mention-text away from this handler.
-            # We still exclude actual /commands via a manual check inside
-            # on_password so /cancel still works as a fallback.
-            ASK_PWD: [MessageHandler(filters.TEXT, on_password)],
+            # BUG FIX: filters.TEXT does NOT match messages where Telegram
+            # attaches a mention entity (e.g. @OnlyLogsCloud) because PTB's
+            # TEXT filter checks message.text but some builds also gate on
+            # entity types. Using filters.ALL here and doing the command-check
+            # manually inside on_password guarantees delivery regardless of
+            # what entities Telegram annotates the message with.
+            ASK_PWD: [MessageHandler(filters.ALL, on_password)],
             ASK_KEYWORDS: [
                 MessageHandler(filters.TEXT, on_keywords)
             ],
