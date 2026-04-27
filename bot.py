@@ -194,6 +194,16 @@ async def on_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     keywords = (update.message.text or "").strip()
+    # Guard: if user accidentally sends a /command here, treat it as cancel
+    # rather than using the command text as the keyword string. Mirrors the
+    # check in on_password so /cancel (and other commands) keep working while
+    # this state uses filters.TEXT (which would otherwise swallow commands).
+    if keywords.startswith("/"):
+        await update.message.reply_text(
+            "Cancelled. Send the command again with the URL."
+        )
+        ctx.user_data.clear()
+        return ConversationHandler.END
     if not keywords:
         await update.message.reply_text("Keywords are required for `/sort`.")
         return ASK_KEYWORDS
