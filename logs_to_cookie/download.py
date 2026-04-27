@@ -224,6 +224,71 @@ def emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:
     stream.flush()
 
 
+class Heartbeat:
+    """Background heartbeat that re-emits a status block every ``interval``
+    seconds while a long-running synchronous operation runs.
+
+    Multi-GB password-protected archives can take many minutes to
+    extract via ``7z`` / ``unrar`` without producing any output, which
+    triggers the bot's subprocess inactivity watchdog. The heartbeat
+    keeps stderr alive so the bot tile keeps refreshing and the
+    watchdog doesn't fire.
+
+    Block format (matches ``_ProgressPrinter`` so the bot's
+    ``_ProgressMessage`` swaps the previous block in place)::
+
+        🌀 Status: <stage>
+        📦 <detail>
+        ⏱️ Elapsed: 1m23s
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        detail: str = "",
+        *,
+        interval: float = 30.0,
+        stream=sys.stderr,
+    ) -> None:
+        self.stage = stage
+        self.detail = detail
+        self.interval = interval
+        self.stream = stream
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start = 0.0
+
+    def _emit(self) -> None:
+        elapsed = time.monotonic() - self._start
+        block = f"🌀 Status: {self.stage}\n"
+        if self.detail:
+            block += f"📦 {self.detail}\n"
+        block += f"⏱️ Elapsed: {_fmt_eta(elapsed)}\n"
+        try:
+            self.stream.write(block)
+            self.stream.flush()
+        except Exception:  # noqa: BLE001 — best-effort, never crash the job
+            pass
+
+    def _run(self) -> None:
+        # First heartbeat is immediate so the bot tile updates straight
+        # away; subsequent ones every ``interval`` seconds.
+        self._emit()
+        while not self._stop.wait(self.interval):
+            self._emit()
+
+    def __enter__(self) -> "Heartbeat":
+        self._start = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
 # ---------------------------------------------------------------------------
 # Single-stream download (with resume)
 # ---------------------------------------------------------------------------
