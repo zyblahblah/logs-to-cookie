@@ -12,6 +12,66 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
+## Telegram bot worker (Railway-ready)
+
+`bot.py` is a Telegram bot that wraps `ulp` / `cookies` / `sort` behind a
+chat flow. Send it a direct download URL, answer a couple of prompts
+(password, keywords), and it runs the same pipeline and ships the result
+back as a zip. A `Procfile` is included so it drops straight into a
+Railway *worker* process — same shape as
+[`zyblahblah/zyblahblah-ulp-to-combo`](https://github.com/zyblahblah/zyblahblah-ulp-to-combo).
+
+### Deploy on Railway
+
+1. Push this repo (or fork it) and create a new Railway project pointing
+   at it.
+2. Railway picks up `requirements.txt` (installs `python-telegram-bot`
+   plus the local `logs-to-cookie` package) and `Procfile`
+   (`worker: python bot.py`).
+3. Open the project's *Variables* tab and add:
+   * `BOT_TOKEN` — token from `@BotFather` (run `/newbot` if you don't
+     have one yet, or `/revoke` → `/token` to rotate an existing one).
+   * `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the
+     bot. The bot refuses everyone else. To find your ID, message
+     `@userinfobot` once.
+   * *(optional)* `WORKERS` — parallel range-split download workers
+     (default `4`).
+   * *(optional)* `DOC_UPLOAD_LIMIT` — max bytes the bot will upload
+     (default `52428800`, i.e. 50 MB — Telegram's standard Bot API
+     limit).
+4. Hit *Deploy*. Watch the worker logs; you should see
+   `logs-to-cookie bot vX.Y.Z starting (admins={...})`.
+
+### Using the bot
+
+In Telegram, message the bot:
+
+```
+/start
+/sort https://example.com/Black%20Logs.zip
+```
+
+It'll prompt for the archive password, then the keywords, then run the
+job and reply with `sort-result.zip`.
+
+* `/cookies <url>` — same flow but skips the keyword prompt.
+* `/ulp <url>` — same, returns a single `creds.ulp.txt` zipped up.
+* Just paste a URL with no command and the bot defaults to `/sort`.
+* `/cancel` aborts an in-progress prompt flow.
+
+> ⚠️ Never paste your bot token into a chat or commit it. If you've
+> shared the token anywhere, rotate it with `@BotFather` → `/revoke`
+> before redeploying.
+
+### Run the bot locally
+
+```bash
+pip install -r requirements.txt
+export BOT_TOKEN=123456:abcdef...
+export ADMIN_IDS=5376199311
+python bot.py
+```
+
 ## Direct download: hand it a URL
 
 Every command (`ulp`, `cookies`, `sort`) accepts an HTTP(S) direct-download
