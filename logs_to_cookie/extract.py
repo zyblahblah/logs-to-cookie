@@ -49,7 +49,10 @@ def _try_zip(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
                 # Wrong password.
                 continue
             except zipfile.BadZipFile:
-                return False
+                # BUG FIX: Some Python builds raise BadZipFile for a wrong
+                # password instead of RuntimeError — continue to next password
+                # rather than giving up on all remaining passwords.
+                continue
     finally:
         zf.close()
     return False

@@ -34,8 +34,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "0.10.0"
-
+__version__ = "0.10.1"
 
 # Re-exposed so old code that did `from urllib.parse import urlparse` keeps
 # working when copy-pasted from this single file.
@@ -173,7 +172,7 @@ def parse_netscape(text: str) -> Iterator[Dict]:
             continue
         line = raw
         if line.startswith("#HttpOnly_"):
-            line = line[len("#HttpOnly_") :]
+            line = line[len("#HttpOnly_"):]
         elif line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
@@ -287,7 +286,7 @@ def collect_cookies(root: Path) -> Iterator[Dict]:
 
 
 def collect_cookies_with_source(root: Path) -> Iterator[Tuple[Dict, Path]]:
-    """Like :func:`collect_cookies` but also yields the originating file."""
+    """Yield ``(cookie, source_file)`` tuples."""
     for path in iter_cookie_files(root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -311,7 +310,7 @@ _ARCHIVE_TEMPDIR_RE = re.compile(r"^x\d{3}_")
 
 
 def source_name_for(path: Path, root: Path) -> str:
-    """Derive a human-friendly source (victim) name for ``path`` under ``root``."""
+    """Derive a human-friendly ``source`` (usually victim) name for ``path``."""
     try:
         rel = path.resolve().relative_to(root.resolve())
     except ValueError:
@@ -330,7 +329,7 @@ def source_name_for(path: Path, root: Path) -> str:
 
 def safe_source_name(name: str) -> str:
     cleaned = "".join(
-        c if c.isalnum() or c in "-_.[]()" else "_" for c in (name or "").strip()
+        c if c.isalnum() or c in '-_.[]()' else '_' for c in (name or '').strip()
     )
     return cleaned or "unknown"
 
@@ -348,7 +347,7 @@ def dedupe_cookies(cookies: Iterable[Dict]) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Archive extraction (password-protected logs)
+# Archive extraction (supports .zip natively; .rar/.7z via system binaries)
 # ---------------------------------------------------------------------------
 
 ARCHIVE_EXTS = {".zip", ".rar", ".7z"}
@@ -370,6 +369,13 @@ def _seven_zip_binary() -> Optional[str]:
 
 
 def _try_zip(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
+    """Try to extract a .zip archive, attempting each password in turn.
+
+    FIX: Previously ``BadZipFile`` was caught and caused an immediate
+    ``return False``, aborting all remaining password attempts. Some
+    Python versions raise ``BadZipFile`` instead of ``RuntimeError`` on
+    a wrong password, so we now ``continue`` to the next password instead.
+    """
     try:
         zf = zipfile.ZipFile(archive)
     except (zipfile.BadZipFile, OSError):
@@ -381,9 +387,12 @@ def _try_zip(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
                 zf.extractall(dest, pwd=pwd_b)
                 return True
             except RuntimeError:
+                # Wrong password — try the next one.
                 continue
             except zipfile.BadZipFile:
-                return False
+                # BUG FIX: Some Python builds raise BadZipFile for wrong
+                # passwords; continue trying instead of giving up entirely.
+                continue
     finally:
         zf.close()
     return False
@@ -435,9 +444,12 @@ def _try_unrar(archive: Path, dest: Path, passwords: List[Optional[str]]) -> boo
     return False
 
 
-def extract_archive(
-    archive: Path, dest: Path, passwords: List[Optional[str]]
-) -> bool:
+def extract_archive(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
+    """Extract ``archive`` into ``dest``, trying each password in turn.
+
+    Returns ``True`` on success, ``False`` if no password worked or a
+    required binary (``unrar``, ``7z``) is not installed.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     ext = archive.suffix.lower()
     if ext == ".zip":
@@ -459,12 +471,17 @@ def expand_input(
     workdir: Path,
     recurse: bool = True,
 ) -> Tuple[List[Path], List[Path]]:
+    """Resolve a mix of directories and archives into extraction roots.
+
+    Returns ``(roots, failures)`` where ``failures`` is a list of archives
+    that could not be extracted (wrong password, missing binary, corruption).
+    """
     pwd_list: List[Optional[str]] = [None]
     for p in passwords:
         if p and p not in pwd_list:
             pwd_list.append(p)
-    workdir.mkdir(parents=True, exist_ok=True)
 
+    workdir.mkdir(parents=True, exist_ok=True)
     roots: List[Path] = []
     failures: List[Path] = []
     queue: List[Path] = []
@@ -510,6 +527,10 @@ def _safe_keyword(k: str) -> str:
 def sort_logs(
     root, out_dir: Path, keywords: Iterable[str]
 ) -> Dict[str, Tuple[int, int]]:
+    """Sort credentials and cookies into per-keyword output files.
+
+    Returns ``{keyword: (ulp_count, cookie_count)}``.
+    """
     if isinstance(root, Path):
         roots = [root]
     else:
@@ -519,8 +540,8 @@ def sort_logs(
         return {}
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ulp_handles: Dict[str, "object"] = {}
-    cookie_handles: Dict[str, "object"] = {}
+    ulp_handles: Dict[str, object] = {}
+    cookie_handles: Dict[str, object] = {}
     seen_ulp = {k: set() for k in kws}
     seen_cookie = {k: set() for k in kws}
     counts = {k: [0, 0] for k in kws}
@@ -570,7 +591,7 @@ def sort_logs(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI helpers
 # ---------------------------------------------------------------------------
 
 
@@ -584,14 +605,11 @@ def _open_out(path: str):
 
 
 # ---------------------------------------------------------------------------
-# HTTP stream downloader (range-split parallel + single-stream fallback)
+# HTTP stream downloader  (range-split parallel + single-stream resume fallback)
 # ---------------------------------------------------------------------------
 
-_DL_CHUNK = 1024 * 1024
-# Per-read socket timeout. urllib raises socket.timeout if no bytes
-# arrive in this many seconds, which the part loop catches as a retry
-# trigger. Tight enough to detect dead connections quickly.
-_DL_TIMEOUT = 30
+_DL_CHUNK = 1024 * 1024  # 1 MiB per read — good balance for flaky mobile links
+_DL_TIMEOUT = 30          # per-read socket timeout (seconds)
 _DL_RETRIES = 5
 _DL_USER_AGENT = (
     f"logs-to-cookie/{__version__} (+https://github.com/zyblahblah/logs-to-cookie)"
@@ -618,6 +636,7 @@ def _dl_open(url: str, headers: Optional[dict] = None, timeout: int = _DL_TIMEOU
 
 
 def _dl_probe(url: str, timeout: int = 30) -> Tuple[Optional[int], bool, str]:
+    """Return ``(content_length, supports_ranges, final_url)`` via HEAD with GET fallback."""
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": _DL_USER_AGENT}, method="HEAD"
@@ -627,6 +646,7 @@ def _dl_probe(url: str, timeout: int = 30) -> Tuple[Optional[int], bool, str]:
             ranges = (r.headers.get("Accept-Ranges") or "").lower() == "bytes"
             return (int(length) if length else None, ranges, r.geturl())
     except Exception:
+        # Some hosts reject HEAD — peek with a tiny ranged GET.
         try:
             req = urllib.request.Request(
                 url,
@@ -644,6 +664,8 @@ def _dl_probe(url: str, timeout: int = 30) -> Tuple[Optional[int], bool, str]:
         except Exception:
             return (None, False, url)
 
+
+# --- Pretty progress formatting ---
 
 def _dl_fmt_size(n: float) -> str:
     if n >= 1024 ** 3:
@@ -678,6 +700,11 @@ def _dl_bar(pct: float, width: int = 14) -> str:
 
 
 def _dl_emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:
+    """Emit a one-shot status block (no progress bar).
+
+    Used by the CLI to announce phases like ``Extracting`` or ``Sorting``
+    so the bot's progress tile stays fresh even when the download is done.
+    """
     block = f"🌀 Status: {stage}\n"
     if detail:
         block += f"📦 {detail}\n"
@@ -686,10 +713,20 @@ def _dl_emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:
 
 
 class _Heartbeat:
-    """Background heartbeat that re-emits a status block while a long
-    synchronous step (e.g. extracting a multi-GB archive via ``7z``) is
-    running. Keeps the bot's subprocess inactivity watchdog from
-    firing on legitimately busy work that produces no output.
+    """Background heartbeat that re-emits a status block every ``interval``
+    seconds while a long-running synchronous step is running.
+
+    Multi-GB password-protected archives can take many minutes to extract
+    via ``7z``/``unrar`` without producing any output, which would trigger
+    the bot's subprocess inactivity watchdog. The heartbeat keeps stderr
+    alive so the bot tile keeps refreshing and the watchdog doesn't fire.
+
+    Block format matches ``_DLProgress`` so bot's ``_ProgressMessage``
+    swaps the previous block in place::
+
+        🌀 Status: <stage>
+        📦 <detail>
+        ⏱️ Elapsed: 1m23s
     """
 
     def __init__(
@@ -717,10 +754,11 @@ class _Heartbeat:
         try:
             self.stream.write(block)
             self.stream.flush()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — never crash the job
             pass
 
     def _run(self) -> None:
+        # First heartbeat is immediate so the bot tile updates right away.
         self._emit()
         while not self._stop.wait(self.interval):
             self._emit()
@@ -738,6 +776,23 @@ class _Heartbeat:
 
 
 class _DLProgress:
+    """Emit a multi-line progress block to ``stream`` on every update.
+
+    Block format::
+
+        🌀 Status: Downloading...
+        📦 <filename>
+        📊 [■■■▧□□□□□□□□□□] 21.0%
+        📡 Progress: 275.00 MB / 1.28 GB
+        ⚡ Speed: 19.64 MB/s | ETA: 52s
+        ⏱️ Elapsed: 15s
+
+    ``bot.py``'s ``_ProgressMessage`` detects ``🌀 Status:`` as a block
+    boundary and replaces the previously-rendered block so the chat message
+    stays a single live tile instead of scrolling. On a real terminal we use
+    ANSI cursor moves to overwrite in place.
+    """
+
     def __init__(self, label: str, stream=sys.stderr, interval: float = 1.0):
         self.label = label
         self.stream = stream
@@ -746,10 +801,10 @@ class _DLProgress:
         self.last = 0.0
         self._lock = threading.Lock()
         self._isatty = bool(getattr(stream, "isatty", lambda: False)())
-        # Lines emitted by the previous block; used to drive the ANSI
-        # cursor-up redraw. Tracks the actual line count so the
-        # unknown-total branch (5 lines) doesn't erase output above us
-        # when redrawing.
+        # Lines emitted by the previous block. Used to drive the ANSI
+        # cursor-up redraw — must match the *actual* line count of the
+        # last block (which differs depending on whether ``total`` was
+        # known), otherwise we'd erase real output above us.
         self._prev_lines = 0
 
     def __call__(self, done: int, total: int, elapsed: float) -> None:
@@ -763,16 +818,16 @@ class _DLProgress:
             ):
                 return
             self.last = now
-            # Use our own monotonic origin instead of the caller's
+            # Use our own monotonic origin rather than the caller's
             # per-attempt timer. ``_dl_stream_to`` resets its local
             # ``start`` on every retry but reports cumulative ``done``
-            # (incl. ``bytes_done_offset``), which would otherwise
-            # produce a wildly inflated speed and a too-rosy ETA right
+            # (including ``bytes_done_offset``), which would otherwise
+            # produce wildly inflated speed and a too-rosy ETA right
             # after a resume.
             real_elapsed = max(now - self.start, 0.0)
             speed_mb = (done / real_elapsed / 1024 / 1024) if real_elapsed > 0 else 0.0
             if total:
-                pct = 100.0 * done / total
+                pct = min(100.0, 100.0 * done / total)
                 eta = (
                     ((total - done) / (done / real_elapsed))
                     if (done and real_elapsed > 0)
@@ -796,8 +851,9 @@ class _DLProgress:
                 )
             line_count = block.count("\n")
             if self._isatty and self._prev_lines:
-                # Move up by the *previous* block's line count, not a
-                # hard-coded constant.
+                # Wipe the previous block so we render in-place. Use the
+                # previous block's actual line count (not a hard-coded
+                # constant) — the unknown-total branch is shorter.
                 self.stream.write(f"\x1b[{self._prev_lines}A\x1b[J")
             self.stream.write(block)
             self.stream.flush()
@@ -809,12 +865,29 @@ def _dl_stream_to(
     dest: Path,
     chunk: int,
     on_progress: Optional[Callable[[int, int, float], None]],
+    # ``total`` here is the number of bytes this request is expected to
+    # deliver (i.e. the remaining bytes when resuming, NOT the full file
+    # size).  ``file_total`` is the advertised full file size and is used
+    # exclusively for progress reporting so percentages stay correct.
     total: Optional[int],
     *,
     headers: Optional[dict] = None,
     bytes_done_offset: int = 0,
+    file_total: Optional[int] = None,
     append: bool = False,
 ) -> None:
+    """Single-stream download to ``dest``.
+
+    BUG FIX (progress bar): Previously ``grand_total`` was calculated as
+    ``(total or 0) + bytes_done_offset`` when resuming, but ``total`` had
+    already been reduced to ``full_size - already`` before being passed in.
+    This caused the progress denominator to be ``(full_size - already) +
+    already == full_size`` only by accident when the server reports the
+    remaining length — but when it reports the *full* length (many CDNs do
+    this even for ranged responses) the denominator would be wrong.  We now
+    pass ``file_total`` explicitly so the progress callback always receives
+    the true full-file size.
+    """
     written = 0
     start = time.monotonic()
     with _dl_open(url, headers=headers) as resp:
@@ -833,14 +906,13 @@ def _dl_stream_to(
                 f.write(buf)
                 written += len(buf)
                 if on_progress:
-                    grand_total = (
-                        ((total or 0) + bytes_done_offset)
-                        if append
-                        else (total or 0)
-                    )
+                    # Use the true full-file size for the denominator so the
+                    # percentage never exceeds 100 % and doesn't jump around
+                    # after a resume.
+                    progress_total = file_total or (total or 0)
                     on_progress(
                         bytes_done_offset + written,
-                        grand_total,
+                        progress_total,
                         time.monotonic() - start,
                     )
 
@@ -853,17 +925,17 @@ def _dl_stream_with_resume(
     on_progress: Optional[Callable[[int, int, float], None]],
     total: Optional[int],
 ) -> None:
+    """Single-stream download with resume-on-error support."""
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
             already = dest.stat().st_size if dest.exists() else 0
             if total is not None and already >= total > 0:
                 return
-            # Only resume via append when we can actually send a Range
-            # request. Without ``total`` we have no way to skip bytes
-            # server-side, so falling back to a full-file GET would
-            # otherwise corrupt the output by appending on top of the
-            # partial bytes.
+            # Only resume via append when we can actually send a Range request.
+            # Without ``total`` we have no way to skip bytes server-side, so a
+            # fresh full-file GET would corrupt the output by appending bytes
+            # on top of the partial download.
             headers = (
                 {"Range": f"bytes={already}-"} if already and total else None
             )
@@ -878,13 +950,18 @@ def _dl_stream_with_resume(
                 dest,
                 chunk,
                 on_progress,
+                # Pass the remaining bytes as ``total`` so the response length
+                # check is against what the server should actually send.
                 (total - already) if (total and headers) else total,
                 headers=headers,
                 bytes_done_offset=already,
+                # Pass the *full* file size separately so progress percentages
+                # are always computed against the true total.
+                file_total=total,
                 append=bool(headers),
             )
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — retry every IO error
             last_exc = exc
             if attempt >= retries:
                 break
@@ -909,6 +986,14 @@ def _dl_part(
     retries: int,
     timeout: int,
 ) -> None:
+    """Download a single byte-range part, retrying on error.
+
+    BUG FIX (progress overshoot): Added a guard to ensure ``bump()`` is
+    never called with more bytes than the part boundary allows. Without it,
+    the last read of a part could be larger than ``remaining``, causing the
+    cumulative ``bytes_done`` counter to exceed ``total`` and the progress
+    bar to briefly show >100 %.
+    """
     written = 0
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
@@ -924,11 +1009,9 @@ def _dl_part(
                 },
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                # Server must return 206 (Partial Content). A 200
-                # response means it's silently ignoring our Range
-                # header and would dump the whole file at our part
-                # offset — corrupting the result and making the
-                # download appear suspiciously fast.
+                # Server MUST return 206 Partial Content. A 200 means it is
+                # silently ignoring our Range header and would dump the whole
+                # file at our part offset — corrupting the output.
                 status = getattr(resp, "status", None) or resp.getcode()
                 if status != 206:
                     raise RuntimeError(
@@ -941,11 +1024,9 @@ def _dl_part(
                         buf = resp.read(chunk)
                         if not buf:
                             break
-                        # ``written`` is the cumulative bytes for this part
-                        # across all attempts, so the remaining-bytes formula
-                        # must be relative to ``start`` (not ``req_start``,
-                        # which already includes the previously-written count
-                        # at attempt entry).
+                        # Clamp to part boundary. ``written`` is cumulative
+                        # across all attempts, so remaining is always relative
+                        # to ``start`` (not ``req_start``).
                         remaining = end - start - written + 1
                         if len(buf) > remaining:
                             buf = buf[:remaining]
@@ -978,7 +1059,11 @@ def stream_download(
     label: str = "",
     show_progress: bool = True,
 ) -> Path:
-    """Download ``url`` to ``dest`` (range-split parallel + single-stream resume fallback)."""
+    """Download ``url`` to ``dest`` using range-split parallel workers.
+
+    Falls back to a single-stream download with resume if the server does
+    not support ``Accept-Ranges`` or the file is too small to split.
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     on_progress = _DLProgress(label or filename_from_url(url)) if show_progress else None
@@ -992,6 +1077,7 @@ def stream_download(
         _dl_check_final_size(dest, total)
         return dest
 
+    # Pre-allocate the destination file so parallel parts can seek into it.
     with open(dest, "wb") as f:
         f.truncate(total)
 
@@ -1002,6 +1088,7 @@ def stream_download(
         end = min(pos + part_size, total) - 1
         parts.append((pos, end))
         pos = end + 1
+
     if show_progress:
         print(
             f"  range-split: {len(parts)} parts × {part_size / 1024 / 1024:.1f} MB → {use_url}",
@@ -1029,7 +1116,7 @@ def stream_download(
             ]
             for fut in concurrent.futures.as_completed(futs):
                 fut.result()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — fall back to single-stream resume
         if show_progress:
             print(
                 f"\n  range-split failed ({exc!r}) → falling back to "
@@ -1037,9 +1124,11 @@ def stream_download(
                 file=sys.stderr,
                 flush=True,
             )
+        # The pre-allocated file is full of zeroes; truncate so the resume
+        # path doesn't think we already have data.
         try:
             dest.unlink(missing_ok=True)
-        except TypeError:
+        except TypeError:  # py < 3.8 unlink has no missing_ok
             if dest.exists():
                 dest.unlink()
         _dl_stream_with_resume(use_url, dest, chunk, retries, on_progress, total)
@@ -1049,7 +1138,12 @@ def stream_download(
 
 
 def _dl_check_final_size(dest: Path, total: Optional[int]) -> None:
-    """Raise if the on-disk file size doesn't match the advertised length."""
+    """Raise if the on-disk file size does not match the advertised length.
+
+    A size mismatch means the download was truncated — any downstream
+    extraction will fail with a misleading "wrong password / missing tool"
+    error without this check.
+    """
     if total is None:
         return
     actual = dest.stat().st_size
@@ -1070,6 +1164,7 @@ def download_to_workdir(
     workers: int = 4,
     label_prefix: str = "Downloading",
 ) -> Path:
+    """Download ``url`` into ``workdir`` using a filename derived from the URL."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     name = filename_from_url(url)
@@ -1081,6 +1176,11 @@ def download_to_workdir(
     return stream_download(url, dest, workers=workers, label=name)
 
 
+# ---------------------------------------------------------------------------
+# Input resolution
+# ---------------------------------------------------------------------------
+
+
 def _resolve_roots(
     stack: contextlib.ExitStack,
     input_path: str,
@@ -1088,6 +1188,13 @@ def _resolve_roots(
     *,
     workers: int = 4,
 ) -> Tuple[List[Path], List[Path]]:
+    """Resolve ``input_path`` into extraction roots.
+
+    If ``input_path`` is an HTTP(S) URL, the file is downloaded first.
+    Archives are extracted using each supplied password in turn.
+
+    Returns ``(roots, failures)``.
+    """
     workdir: Optional[Path] = None
     if is_url(input_path):
         workdir = Path(
@@ -1098,13 +1205,16 @@ def _resolve_roots(
         inp = Path(input_path)
         if not inp.exists():
             return [], []
+
     do_extract = bool(passwords) or (inp.is_file() and is_archive(inp))
     if not do_extract:
         return [inp], []
+
     if workdir is None:
         workdir = Path(
             stack.enter_context(tempfile.TemporaryDirectory(prefix="l2c-"))
         )
+
     inputs: List[Path] = []
     if inp.is_file():
         inputs.append(inp)
@@ -1113,6 +1223,7 @@ def _resolve_roots(
         for child in inp.rglob("*"):
             if child.is_file() and is_archive(child):
                 inputs.append(child)
+
     with _Heartbeat("Extracting archive...", inp.name):
         return expand_input(inputs, passwords, workdir)
 
@@ -1131,7 +1242,13 @@ def _report_failures(failures: List[Path]) -> None:
         print(f"  ... and {len(failures) - 10} more", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Subcommand implementations
+# ---------------------------------------------------------------------------
+
+
 def cmd_ulp(args: argparse.Namespace) -> int:
+    """Extract URL:USER:PASS lines from log dumps."""
     with contextlib.ExitStack() as stack:
         roots, failures = _resolve_roots(
             stack, args.input, args.password, workers=getattr(args, "workers", 4)
@@ -1180,6 +1297,7 @@ def _write_cookies_file(path: Path, cookies: List[Dict], fmt: str) -> None:
 
 
 def cmd_cookies(args: argparse.Namespace) -> int:
+    """Collect and normalise cookies from log dumps."""
     with contextlib.ExitStack() as stack:
         roots, failures = _resolve_roots(
             stack, args.input, args.password, workers=getattr(args, "workers", 4)
@@ -1194,6 +1312,7 @@ def cmd_cookies(args: argparse.Namespace) -> int:
         per_source = getattr(args, "per_source", False)
 
         if per_source:
+            # One sub-folder per source (victim): <out>/<source>/cookies.[txt|json]
             out_dir = Path(args.output)
             out_dir.mkdir(parents=True, exist_ok=True)
             filename = "cookies.txt" if args.format == "netscape" else "cookies.json"
@@ -1207,19 +1326,19 @@ def cmd_cookies(args: argparse.Namespace) -> int:
                     name = safe_source_name(source_name_for(src_path, root))
                     groups.setdefault(name, []).append(cookie)
 
-            total = 0
+            total_cookies = 0
             for name in sorted(groups):
                 deduped = dedupe_cookies(groups[name])
                 if not deduped:
                     continue
                 _write_cookies_file(out_dir / name / filename, deduped, args.format)
-                total += len(deduped)
+                total_cookies += len(deduped)
                 print(
                     f"  {name}: {len(deduped)} cookies -> {out_dir / name / filename}",
                     file=sys.stderr,
                 )
             print(
-                f"wrote {total} cookies across {len(groups)} source(s) to {out_dir}",
+                f"wrote {total_cookies} cookies across {len(groups)} source(s) to {out_dir}",
                 file=sys.stderr,
             )
             return 0
@@ -1242,10 +1361,20 @@ def cmd_cookies(args: argparse.Namespace) -> int:
 def _sort_per_source(
     roots: List[Path], out_dir: Path, keywords: List[str]
 ) -> Dict[str, int]:
-    """Per-victim folder, one Netscape file per source cookie file::
+    """Per-victim folder layout::
 
-        out_dir/<victim>/<orig_name>_<hash6>.txt   # one Netscape file per source
-        out_dir/<victim>/creds.txt                 # merged keyword-matching creds
+        out_dir/
+          <victim>/
+            <orig_cookie_filename>_<hash6>.txt   # Netscape, one per source file
+            creds.txt                            # merged keyword-matching creds
+
+    A source cookie file is included only if at least one cookie matches a
+    keyword. The hash suffix prevents collisions when multiple source files
+    share the same basename (e.g. several ``Cookies.txt`` from different
+    browser profiles in the same victim's log dump).
+
+    Returns a summary dict with keys ``victims``, ``ulp``,
+    ``cookie_files``, and ``cookies``.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     kws_lower = [k.lower() for k in keywords]
@@ -1320,6 +1449,7 @@ def _sort_per_source(
 
 
 def cmd_sort(args: argparse.Namespace) -> int:
+    """Bucket logs into per-keyword (or per-victim) ULP + cookie files."""
     with contextlib.ExitStack() as stack:
         roots, failures = _resolve_roots(
             stack, args.input, args.password, workers=getattr(args, "workers", 4)
@@ -1351,24 +1481,32 @@ def cmd_sort(args: argparse.Namespace) -> int:
         return 0
 
 
-def _add_password_arg(parser: argparse.ArgumentParser) -> None:
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add ``--password`` and ``--workers`` to a subparser."""
     parser.add_argument(
         "--password",
         action="append",
         default=[],
+        metavar="PWD",
         help=(
-            "Password for archived logs (.zip/.rar/.7z). May be repeated to "
-            "try several. Without --password, archives in the input are left "
-            "untouched."
+            "Password for encrypted archives (.zip/.rar/.7z). "
+            "Repeat to try multiple passwords. "
+            "Without --password, archives are left untouched."
         ),
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=4,
+        metavar="N",
         help=(
-            "Parallel range-split download workers when input is an HTTP(S) "
-            "URL. Default 4. Set to 1 to force a single stream."
+            "Parallel range-split download workers when the input is an "
+            "HTTP(S) URL (default: 4). Use 1 to force a single stream."
         ),
     )
 
@@ -1376,89 +1514,138 @@ def _add_password_arg(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="logs_to_cookie.py",
-        description="Sort and convert log dumps into ULP and cookie formats (single-file edition).",
+        description=(
+            "Sort and convert stealer-style log dumps into ULP and cookie formats.\n"
+            "Single-file edition — stdlib only, no install required."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--version", action="version", version=__version__)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pu = sub.add_parser("ulp", help="extract URL:USER:PASS lines from log dumps")
-    pu.add_argument("input", help="path to log directory or file")
-    pu.add_argument("-o", "--output", default="-", help="output file (- for stdout)")
+    # --- ulp ---
+    pu = sub.add_parser(
+        "ulp",
+        help="Extract URL:USER:PASS lines from log dumps.",
+        description=(
+            "Walk a directory (or download and extract an archive) and write "
+            "one URL:USER:PASS line per credential found."
+        ),
+    )
+    pu.add_argument(
+        "input",
+        help="Path to a log directory, file, archive (.zip/.rar/.7z), or http(s) URL.",
+    )
+    pu.add_argument(
+        "-o", "--output",
+        default="-",
+        metavar="FILE",
+        help="Output file path. Use '-' to write to stdout (default: -).",
+    )
     pu.add_argument(
         "--filter",
-        help="comma-separated keywords matched against URL/host (substring)",
+        metavar="KEYWORDS",
+        help="Comma-separated keywords; only include lines whose URL/host contains one.",
     )
     pu.add_argument(
-        "--no-dedupe", action="store_true", help="keep duplicate lines (default: dedupe)"
+        "--no-dedupe",
+        action="store_true",
+        help="Keep duplicate URL:USER:PASS lines (default: deduplicate).",
     )
-    _add_password_arg(pu)
+    _add_common_args(pu)
     pu.set_defaults(func=cmd_ulp)
 
-    pc = sub.add_parser("cookies", help="collect and normalize cookies")
-    pc.add_argument("input", help="path to log directory or file")
+    # --- cookies ---
+    pc = sub.add_parser(
+        "cookies",
+        help="Collect and normalise Netscape/JSON cookies from log dumps.",
+        description=(
+            "Parse all cookie files found under the input path and write them "
+            "as Netscape cookies.txt (default) or JSON."
+        ),
+    )
     pc.add_argument(
-        "-o",
-        "--output",
+        "input",
+        help="Path to a log directory, file, archive (.zip/.rar/.7z), or http(s) URL.",
+    )
+    pc.add_argument(
+        "-o", "--output",
         required=True,
+        metavar="PATH",
         help=(
-            "output file path (default), or output directory when "
-            "--per-source is set"
+            "Output file path (single merged file) or directory when "
+            "--per-source is active."
         ),
     )
     pc.add_argument(
         "--format",
         choices=["netscape", "json"],
         default="netscape",
-        help="output format (default: netscape cookies.txt)",
+        help="Output format (default: netscape).",
     )
     pc.add_argument(
         "--filter",
-        help="comma-separated keywords matched against cookie domain (substring)",
+        metavar="KEYWORDS",
+        help="Comma-separated keywords; only include cookies whose domain contains one.",
     )
     pc.add_argument(
         "--per-source",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "write one folder per source (victim) under --output, each "
-            "containing a single cookies.txt/.json for that source. "
-            "Default is on; pass --no-per-source for a single merged file."
+            "Write one sub-folder per victim under --output, each containing "
+            "a single cookies.txt/.json (default: on). "
+            "Pass --no-per-source for a single merged output file."
         ),
     )
-    _add_password_arg(pc)
+    _add_common_args(pc)
     pc.set_defaults(func=cmd_cookies)
 
+    # --- sort ---
     ps = sub.add_parser(
         "sort",
-        help="bucket logs into per-keyword ULP + cookies files",
+        help="Bucket logs into per-keyword or per-victim ULP + cookie files.",
+        description=(
+            "Filter credentials and cookies by keyword and write the results "
+            "into an organised output directory."
+        ),
     )
-    ps.add_argument("input", help="path to log directory")
-    ps.add_argument("-o", "--output", required=True, help="output directory")
+    ps.add_argument(
+        "input",
+        help="Path to a log directory, archive (.zip/.rar/.7z), or http(s) URL.",
+    )
+    ps.add_argument(
+        "-o", "--output",
+        required=True,
+        metavar="DIR",
+        help="Output directory (created if it does not exist).",
+    )
     ps.add_argument(
         "--keywords",
         required=True,
-        help="comma-separated keywords (e.g. netflix,spotify,roblox)",
+        metavar="KEYWORDS",
+        help="Comma-separated filter keywords, e.g. netflix,spotify,roblox.",
     )
     ps.add_argument(
         "--per-source",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "write one folder per victim with a hit "
-            "(<output>/<victim>/cookies.txt + creds.txt) — keywords act "
-            "as a filter, not as folders. Default is on; pass "
-            "--no-per-source for the legacy merged <keyword>.ulp.txt + "
-            "<keyword>.cookies.txt layout."
+            "Write one folder per victim that has a hit "
+            "(<out>/<victim>/cookies.txt + creds.txt). "
+            "Keywords act as a filter, not folder names (default: on). "
+            "Pass --no-per-source for the legacy merged layout: "
+            "<keyword>.ulp.txt + <keyword>.cookies.txt."
         ),
     )
-    _add_password_arg(ps)
+    _add_common_args(ps)
     ps.set_defaults(func=cmd_sort)
 
     return p
 
 
 # ---------------------------------------------------------------------------
-# Interactive menu (used when no subcommand is supplied)
+# Interactive menu  (used when the script is run with no arguments)
 # ---------------------------------------------------------------------------
 
 
@@ -1510,11 +1697,7 @@ def _build_args(**kwargs) -> argparse.Namespace:
 
 
 def run_interactive() -> int:
-    """Simple menu-driven flow used when the script is run with no args.
-
-    Designed for Termux / mobile "run this file" launchers where you don't
-    have a persistent shell to pass CLI flags.
-    """
+    """Simple menu-driven flow for Termux / mobile launchers with no shell flags."""
     print("=" * 52)
     print(f" logs-to-cookie v{__version__} — interactive mode")
     print("=" * 52)
@@ -1538,7 +1721,10 @@ def run_interactive() -> int:
             inp = _ask_nonempty("Input path or http(s) URL (dir, file, .zip/.rar/.7z)")
             passwords = _ask_passwords()
             workers = _ask_workers(inp)
-            filt = _ask("Filter keywords (substring, comma-separated; blank=all)", default="")
+            filt = _ask(
+                "Filter keywords (substring, comma-separated; blank = all)",
+                default="",
+            )
             out = _ask("Output file (- for stdout)", default="creds.ulp.txt")
             return cmd_ulp(
                 _build_args(
@@ -1556,7 +1742,8 @@ def run_interactive() -> int:
             passwords = _ask_passwords()
             workers = _ask_workers(inp)
             filt = _ask(
-                "Filter keywords (cookie domain substring; blank=all)", default=""
+                "Filter keywords (cookie domain substring; blank = all)",
+                default="",
             )
             fmt_choice = _ask("Format [1=netscape, 2=json]", default="1")
             fmt = "json" if fmt_choice.strip() in ("2", "json") else "netscape"
@@ -1612,14 +1799,16 @@ def run_interactive() -> int:
     return 2
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 def main(argv=None) -> int:
-    # Drop into the interactive menu when no arguments were given (e.g. when
-    # the script is run by a mobile launcher that just double-taps the file).
     if argv is None:
         argv = sys.argv[1:]
     if not argv:
         return run_interactive()
-
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

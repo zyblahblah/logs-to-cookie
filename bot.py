@@ -168,8 +168,11 @@ async def cmd_ulp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     pwd = (update.message.text or "").strip()
+    # BUG FIX: Added "no" and "nil" to the list of words that mean
+    # "no password".  Previously typing "no" stored it as the literal
+    # archive password and made every subsequent extraction fail.
     ctx.user_data["job_passwords"] = (
-        [] if pwd.lower() in ("", "none", "n/a", "-") else [pwd]
+        [] if pwd.lower() in ("", "none", "no", "nil", "n/a", "-") else [pwd]
     )
     if ctx.user_data.get("job_needs_keywords"):
         await update.message.reply_text(
@@ -650,6 +653,13 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_chat=True,
         per_user=True,
+        # BUG FIX: Without allow_reentry the handler ignores a second /sort,
+        # /cookies or /ulp command while a previous conversation is still
+        # open.  The entry-point message falls through to on_password (the
+        # active state handler), which silently uses the command text as the
+        # archive password — causing every subsequent job to fail with a
+        # "wrong password" error until the user explicitly /cancel-s first.
+        allow_reentry=True,
     )
     app.add_handler(sort_conv)
     return app
