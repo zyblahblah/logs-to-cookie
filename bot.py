@@ -220,13 +220,113 @@ def _build_argv(
     return argv
 
 
-def _zip_dir(src: Path, dest: Path) -> int:
-    """Zip ``src`` recursively into ``dest``. Returns total bytes written."""
-    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in src.rglob("*"):
-            if p.is_file():
-                zf.write(p, p.relative_to(src))
+def _zip_dir(
+    src: Path,
+    dest: Path,
+    *,
+    on_progress=None,
+) -> int:
+    """Zip ``src`` recursively into ``dest``. Returns total bytes written.
+
+    Uses ``compresslevel=1`` because the per-file Python overhead
+    dominates over compression ratio for many tiny text files (Netscape
+    cookies are typically 1-5 KB each and a single big sort job may
+    produce tens of thousands of entries). Level 1 is dramatically
+    faster than the default level 6 with only a small loss in size.
+
+    ``on_progress(files_done, bytes_in)`` is called after each file so
+    the caller can render a heartbeat tile.
+    """
+    files = [p for p in src.rglob("*") if p.is_file()]
+    bytes_in = 0
+    with zipfile.ZipFile(
+        dest, "w", zipfile.ZIP_DEFLATED, compresslevel=1
+    ) as zf:
+        for i, p in enumerate(files, 1):
+            zf.write(p, p.relative_to(src))
+            try:
+                bytes_in += p.stat().st_size
+            except OSError:
+                pass
+            if on_progress is not None:
+                on_progress(i, len(files), bytes_in)
     return dest.stat().st_size
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def _fmt_size(n: float) -> str:
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.2f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.2f} KB"
+    return f"{int(n)} B"
+
+
+async def _zip_dir_async(src: Path, dest: Path, prog) -> int:
+    """Run :func:`_zip_dir` in a thread while emitting periodic
+    ``🌀 Status: Packaging result...`` heartbeat blocks to ``prog``.
+
+    The synchronous zip would otherwise block the asyncio event loop,
+    keeping the bot from updating the chat tile or responding to other
+    users for the entire duration of the zip — which on a job with
+    tens of thousands of small Netscape cookie files can run into many
+    minutes.
+    """
+    loop = asyncio.get_running_loop()
+    started = time.monotonic()
+    state = {"files": 0, "total": 0, "bytes": 0}
+
+    def _on_progress(files_done: int, total_files: int, bytes_in: int) -> None:
+        state["files"] = files_done
+        state["total"] = total_files
+        state["bytes"] = bytes_in
+
+    fut = loop.run_in_executor(
+        None, lambda: _zip_dir(src, dest, on_progress=_on_progress)
+    )
+
+    async def _heartbeat() -> None:
+        # Emit immediately so the tile flips to "Packaging result..."
+        # the moment the zip starts, then every 5s until the zip
+        # finishes.
+        while not fut.done():
+            elapsed = time.monotonic() - started
+            await prog.push("🌀 Status: Packaging result...")
+            if state["total"]:
+                await prog.push(
+                    f"📦 {state['files']} / {state['total']} files"
+                )
+            if state["bytes"]:
+                await prog.push(f"📡 Read: {_fmt_size(state['bytes'])}")
+            await prog.push(f"⏱️ Elapsed: {_fmt_elapsed(elapsed)}")
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:  # noqa: BLE001
+                return
+
+    hb = asyncio.create_task(_heartbeat())
+    try:
+        size = await fut
+    finally:
+        try:
+            await hb
+        except Exception:  # noqa: BLE001
+            pass
+    return size
 
 
 class _ProgressMessage:
@@ -436,7 +536,7 @@ async def _run_job(
             return ConversationHandler.END
 
         zip_path = work / f"{cmd}-result.zip"
-        size = _zip_dir(out_dir, zip_path)
+        size = await _zip_dir_async(out_dir, zip_path, prog)
         size_mb = size / 1024 / 1024
         if size > DOC_UPLOAD_LIMIT:
             await prog.finish(
@@ -447,13 +547,39 @@ async def _run_job(
             )
             return ConversationHandler.END
 
-        await prog.finish(f"Done — uploading {size_mb:.1f} MB...")
-        with open(zip_path, "rb") as fh:
-            await update.message.reply_document(
-                document=fh,
-                filename=zip_path.name,
-                caption=f"/{cmd} result ({size_mb:.1f} MB)",
-            )
+        upload_started = time.monotonic()
+        upload_done = asyncio.Event()
+
+        async def _upload_heartbeat() -> None:
+            # Emit immediately so the tile flips to "Uploading..." the
+            # moment we start sending; then refresh every 15s with the
+            # elapsed time so a slow Telegram upload doesn't look frozen.
+            while not upload_done.is_set():
+                elapsed = time.monotonic() - upload_started
+                await prog.push("🌀 Status: Uploading...")
+                await prog.push(f"📦 {zip_path.name}")
+                await prog.push(f"📡 {size_mb:.1f} MB")
+                await prog.push(f"⏱️ Elapsed: {_fmt_elapsed(elapsed)}")
+                try:
+                    await asyncio.wait_for(upload_done.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    continue
+
+        hb_task = asyncio.create_task(_upload_heartbeat())
+        try:
+            with open(zip_path, "rb") as fh:
+                await update.message.reply_document(
+                    document=fh,
+                    filename=zip_path.name,
+                    caption=f"/{cmd} result ({size_mb:.1f} MB)",
+                )
+        finally:
+            upload_done.set()
+            try:
+                await hb_task
+            except Exception:  # noqa: BLE001
+                pass
+        await prog.finish(f"Done — sent {size_mb:.1f} MB.")
     except Exception:
         # Make absolutely sure we never leave the conversation hanging.
         log.exception("job failed for /%s %s", cmd, url)
