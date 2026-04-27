@@ -269,19 +269,24 @@ async def _stream_proc(proc: asyncio.subprocess.Process, prog: _ProgressMessage)
         if not chunk:
             break
         buf += chunk
-        # Split on either \n or \r so we pick up in-place progress updates
-        # written by the downloader.
+        # Split on whichever of \n or \r appears first — the downloader's
+        # in-place progress bar writes \r-separated frames, so we need to
+        # treat \r as a real line terminator (not a fallback after \n).
         while True:
-            for sep in (b"\n", b"\r"):
-                idx = buf.find(sep)
-                if idx >= 0:
-                    line, buf = buf[:idx], buf[idx + 1 :]
-                    text = line.decode("utf-8", "replace")
-                    if text.strip():
-                        await prog.push(text)
-                    break
-            else:
+            idx_n = buf.find(b"\n")
+            idx_r = buf.find(b"\r")
+            if idx_n < 0 and idx_r < 0:
                 break
+            if idx_n < 0:
+                idx = idx_r
+            elif idx_r < 0:
+                idx = idx_n
+            else:
+                idx = min(idx_n, idx_r)
+            line, buf = buf[:idx], buf[idx + 1 :]
+            text = line.decode("utf-8", "replace")
+            if text.strip():
+                await prog.push(text)
 
 
 async def _run_job(
@@ -290,21 +295,33 @@ async def _run_job(
     *,
     keywords: Optional[str],
 ) -> int:
-    cmd = ctx.user_data["job_cmd"]
-    url = ctx.user_data["job_url"]
-    passwords = ctx.user_data.get("job_passwords", [])
-    ctx.user_data.clear()
-
-    progress_msg = await update.message.reply_text(
-        f"*Job queued*\n`/{cmd}` ← {url}", parse_mode=ParseMode.MARKDOWN
-    )
-    prog = _ProgressMessage(
-        progress_msg, header=f"*Running* `/{cmd}`  workers={WORKERS}"
-    )
+    # Snapshot the job state but DON'T clear ``user_data`` until the
+    # conversation has actually terminated. If we cleared eagerly and a later
+    # call raised (Telegram BadRequest, network blip, etc.) the function
+    # would never return ``ConversationHandler.END``, leaving the user stuck
+    # in ``ASK_PWD`` / ``ASK_KEYWORDS`` with empty user_data — every
+    # subsequent message would then ``KeyError`` here.
+    cmd = ctx.user_data.get("job_cmd")
+    url = ctx.user_data.get("job_url")
+    passwords = list(ctx.user_data.get("job_passwords", []))
+    if not cmd or not url:
+        ctx.user_data.clear()
+        await update.message.reply_text(
+            "Sorry — job state was lost. Please start over with /sort, "
+            "/cookies, or /ulp."
+        )
+        return ConversationHandler.END
 
     work = Path(tempfile.mkdtemp(prefix="bot-job-"))
     out_dir = work / "out"
     try:
+        progress_msg = await update.message.reply_text(
+            f"Job queued: /{cmd} <- {url}"
+        )
+        prog = _ProgressMessage(
+            progress_msg, header=f"*Running* `/{cmd}`  workers={WORKERS}"
+        )
+
         argv = _build_argv(cmd, url, passwords, keywords, out_dir)
         log.info("running: %s", " ".join(argv))
         proc = await asyncio.create_subprocess_exec(
@@ -315,11 +332,11 @@ async def _run_job(
         await _stream_proc(proc, prog)
         rc = await proc.wait()
         if rc != 0:
-            await prog.finish(f"❌ Job failed (exit {rc}).")
+            await prog.finish(f"Job failed (exit {rc}).")
             return ConversationHandler.END
 
         if not out_dir.exists():
-            await prog.finish("❌ No output produced.")
+            await prog.finish("No output produced.")
             return ConversationHandler.END
 
         zip_path = work / f"{cmd}-result.zip"
@@ -327,23 +344,35 @@ async def _run_job(
         size_mb = size / 1024 / 1024
         if size > DOC_UPLOAD_LIMIT:
             await prog.finish(
-                f"⚠️ Result is {size_mb:.1f} MB which exceeds Telegram's "
+                f"Result is {size_mb:.1f} MB which exceeds Telegram's "
                 f"{DOC_UPLOAD_LIMIT // 1024 // 1024} MB upload limit. "
-                "Re-run with tighter keywords or run a self-hosted Bot API "
-                "server and raise `DOC_UPLOAD_LIMIT`."
+                "Re-run with tighter keywords or raise DOC_UPLOAD_LIMIT "
+                "behind a self-hosted Bot API server."
             )
             return ConversationHandler.END
 
-        await prog.finish(f"✅ Done — uploading {size_mb:.1f} MB…")
+        await prog.finish(f"Done — uploading {size_mb:.1f} MB...")
         with open(zip_path, "rb") as fh:
             await update.message.reply_document(
                 document=fh,
                 filename=zip_path.name,
-                caption=f"`/{cmd}` result ({size_mb:.1f} MB)",
-                parse_mode=ParseMode.MARKDOWN,
+                caption=f"/{cmd} result ({size_mb:.1f} MB)",
             )
+    except Exception:
+        # Make absolutely sure we never leave the conversation hanging.
+        log.exception("job failed for /%s %s", cmd, url)
+        try:
+            await update.message.reply_text(
+                "Job failed unexpectedly — see worker logs. State has been "
+                "reset; start over with /sort, /cookies, or /ulp."
+            )
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        # Only clear once everything (success or handled error) is done so
+        # that any future /cancel still works as expected.
+        ctx.user_data.clear()
     return ConversationHandler.END
 
 
