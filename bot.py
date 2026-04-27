@@ -663,32 +663,29 @@ def build_application() -> Application:
             CommandHandler("sort", cmd_sort),
             CommandHandler("cookies", cmd_cookies),
             CommandHandler("ulp", cmd_ulp),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_url),
         ],
         states={
-            # BUG FIX: filters.TEXT does NOT match messages where Telegram
-            # attaches a mention entity (e.g. @OnlyLogsCloud) because PTB's
-            # TEXT filter checks message.text but some builds also gate on
-            # entity types. Using filters.ALL here and doing the command-check
-            # manually inside on_password guarantees delivery regardless of
-            # what entities Telegram annotates the message with.
+            # Use filters.ALL so any text message reaches on_password —
+            # including messages with url/mention/hashtag entities which PTB
+            # would otherwise not deliver via filters.TEXT.
             ASK_PWD: [MessageHandler(filters.ALL, on_password)],
-            ASK_KEYWORDS: [
-                MessageHandler(filters.TEXT, on_keywords)
-            ],
+            ASK_KEYWORDS: [MessageHandler(filters.TEXT, on_keywords)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_chat=True,
         per_user=True,
-        # BUG FIX: Without allow_reentry the handler ignores a second /sort,
-        # /cookies or /ulp command while a previous conversation is still
-        # open.  The entry-point message falls through to on_password (the
-        # active state handler), which silently uses the command text as the
-        # archive password — causing every subsequent job to fail with a
-        # "wrong password" error until the user explicitly /cancel-s first.
         allow_reentry=True,
     )
     app.add_handler(sort_conv)
+    # on_plain_url is a SEPARATE lower-priority handler registered AFTER the
+    # ConversationHandler. PTB processes handlers in registration order and
+    # stops at the first match — so while a conversation is active (ASK_PWD /
+    # ASK_KEYWORDS), the ConversationHandler consumes the message and
+    # on_plain_url never sees it. This was the root cause of the password bug:
+    # previously on_plain_url was inside entry_points, which PTB re-evaluates
+    # on every message even mid-conversation, hijacking URL/mention passwords
+    # back to the start instead of delivering them to on_password.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_url))
     return app
 
 
