@@ -34,7 +34,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 
 # Re-exposed so old code that did `from urllib.parse import urlparse` keeps
@@ -588,8 +588,11 @@ def _open_out(path: str):
 # ---------------------------------------------------------------------------
 
 _DL_CHUNK = 1024 * 1024
-_DL_TIMEOUT = 60
-_DL_RETRIES = 3
+# Per-read socket timeout. urllib raises socket.timeout if no bytes
+# arrive in this many seconds, which the part loop catches as a retry
+# trigger. Tight enough to detect dead connections quickly.
+_DL_TIMEOUT = 30
+_DL_RETRIES = 5
 _DL_USER_AGENT = (
     f"logs-to-cookie/{__version__} (+https://github.com/zyblahblah/logs-to-cookie)"
 )
@@ -642,41 +645,99 @@ def _dl_probe(url: str, timeout: int = 30) -> Tuple[Optional[int], bool, str]:
             return (None, False, url)
 
 
+def _dl_fmt_size(n: float) -> str:
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.2f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.2f} KB"
+    return f"{int(n)} B"
+
+
+def _dl_fmt_eta(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def _dl_bar(pct: float, width: int = 14) -> str:
+    pct = max(0.0, min(100.0, pct))
+    full = int(pct / 100 * width)
+    rem = (pct / 100 * width) - full
+    s = "■" * full
+    if full < width:
+        s += "▧" if rem >= 0.25 else "□"
+        s += "□" * (width - full - 1)
+    return s
+
+
+def _dl_emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:
+    block = f"🌀 Status: {stage}\n"
+    if detail:
+        block += f"📦 {detail}\n"
+    stream.write(block)
+    stream.flush()
+
+
 class _DLProgress:
-    def __init__(self, label: str, stream=sys.stderr, interval: float = 0.5):
+    BLOCK_LINES = 6
+
+    def __init__(self, label: str, stream=sys.stderr, interval: float = 1.0):
         self.label = label
         self.stream = stream
         self.interval = interval
+        self.start = time.monotonic()
         self.last = 0.0
         self._lock = threading.Lock()
+        self._isatty = bool(getattr(stream, "isatty", lambda: False)())
+        self._printed = False
 
     def __call__(self, done: int, total: int, elapsed: float) -> None:
         now = time.monotonic()
         with self._lock:
-            if now - self.last < self.interval and (not total or done < total):
+            done_final = bool(total) and done >= total
+            if (
+                now - self.last < self.interval
+                and not done_final
+                and self._printed
+            ):
                 return
             self.last = now
-            mb = done / 1024 / 1024
-            speed = (done / elapsed / 1024 / 1024) if elapsed > 0 else 0.0
+            speed_mb = (done / elapsed / 1024 / 1024) if elapsed > 0 else 0.0
             if total:
-                t_mb = total / 1024 / 1024
                 pct = 100.0 * done / total
                 eta = (
                     ((total - done) / (done / elapsed))
                     if (done and elapsed > 0)
                     else 0.0
                 )
-                line = (
-                    f"\r{self.label}: {mb:7.1f} / {t_mb:7.1f} MB "
-                    f"({pct:5.1f}%)  {speed:6.2f} MB/s  ETA {int(eta):4d}s"
+                block = (
+                    f"🌀 Status: Downloading...\n"
+                    f"📦 {self.label}\n"
+                    f"📊 [{_dl_bar(pct)}] {pct:.1f}%\n"
+                    f"📡 Progress: {_dl_fmt_size(done)} / {_dl_fmt_size(total)}\n"
+                    f"⚡ Speed: {speed_mb:.2f} MB/s | ETA: {_dl_fmt_eta(eta)}\n"
+                    f"⏱️ Elapsed: {_dl_fmt_eta(elapsed)}\n"
                 )
             else:
-                line = f"\r{self.label}: {mb:7.1f} MB  {speed:6.2f} MB/s"
-            self.stream.write(line)
+                block = (
+                    f"🌀 Status: Downloading...\n"
+                    f"📦 {self.label}\n"
+                    f"📡 Progress: {_dl_fmt_size(done)}\n"
+                    f"⚡ Speed: {speed_mb:.2f} MB/s\n"
+                    f"⏱️ Elapsed: {_dl_fmt_eta(elapsed)}\n"
+                )
+            if self._isatty and self._printed:
+                self.stream.write(f"\x1b[{self.BLOCK_LINES}A\x1b[J")
+            self.stream.write(block)
             self.stream.flush()
-            if total and done >= total:
-                self.stream.write("\n")
-                self.stream.flush()
+            self._printed = True
 
 
 def _dl_stream_to(
@@ -685,17 +746,22 @@ def _dl_stream_to(
     chunk: int,
     on_progress: Optional[Callable[[int, int, float], None]],
     total: Optional[int],
+    *,
+    headers: Optional[dict] = None,
+    bytes_done_offset: int = 0,
+    append: bool = False,
 ) -> None:
     written = 0
     start = time.monotonic()
-    with _dl_open(url) as resp:
+    with _dl_open(url, headers=headers) as resp:
         if total is None:
             length = resp.headers.get("Content-Length")
             try:
                 total = int(length) if length else None
             except ValueError:
                 total = None
-        with open(dest, "wb") as f:
+        mode = "ab" if append else "wb"
+        with open(dest, mode) as f:
             while True:
                 buf = resp.read(chunk)
                 if not buf:
@@ -703,7 +769,57 @@ def _dl_stream_to(
                 f.write(buf)
                 written += len(buf)
                 if on_progress:
-                    on_progress(written, total or 0, time.monotonic() - start)
+                    grand_total = (
+                        ((total or 0) + bytes_done_offset)
+                        if append
+                        else (total or 0)
+                    )
+                    on_progress(
+                        bytes_done_offset + written,
+                        grand_total,
+                        time.monotonic() - start,
+                    )
+
+
+def _dl_stream_with_resume(
+    url: str,
+    dest: Path,
+    chunk: int,
+    retries: int,
+    on_progress: Optional[Callable[[int, int, float], None]],
+    total: Optional[int],
+) -> None:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            already = dest.stat().st_size if dest.exists() else 0
+            if total is not None and already >= total > 0:
+                return
+            headers = (
+                {"Range": f"bytes={already}-"} if already and total else None
+            )
+            _dl_stream_to(
+                url,
+                dest,
+                chunk,
+                on_progress,
+                (total - already) if (total and headers) else total,
+                headers=headers,
+                bytes_done_offset=already,
+                append=bool(already),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            backoff = min(2 ** attempt, 30)
+            print(
+                f"\n  single-stream attempt {attempt + 1} failed ({exc!r}); "
+                f"resuming in {backoff}s…",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(backoff)
+    raise RuntimeError(f"single-stream download failed: {last_exc}")
 
 
 def _dl_part(
@@ -714,6 +830,7 @@ def _dl_part(
     chunk: int,
     bump: Callable[[int], None],
     retries: int,
+    timeout: int,
 ) -> None:
     written = 0
     last_exc: Optional[Exception] = None
@@ -729,7 +846,7 @@ def _dl_part(
                     "Range": f"bytes={req_start}-{end}",
                 },
             )
-            with urllib.request.urlopen(req, timeout=_DL_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 with open(dest, "rb+") as f:
                     f.seek(req_start)
                     while True:
@@ -756,7 +873,7 @@ def _dl_part(
             )
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            time.sleep(min(2 ** attempt, 15))
+        time.sleep(min(2 ** attempt, 30))
     raise RuntimeError(f"part {start}-{end} failed: {last_exc}")
 
 
@@ -767,20 +884,21 @@ def stream_download(
     workers: int = 4,
     chunk: int = _DL_CHUNK,
     retries: int = _DL_RETRIES,
-    label: str = "Downloading",
+    timeout: int = _DL_TIMEOUT,
+    label: str = "",
     show_progress: bool = True,
 ) -> Path:
-    """Download ``url`` to ``dest`` (range-split parallel + fallback)."""
+    """Download ``url`` to ``dest`` (range-split parallel + single-stream resume fallback)."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    on_progress = _DLProgress(label) if show_progress else None
+    on_progress = _DLProgress(label or filename_from_url(url)) if show_progress else None
     total, ranges_ok, final_url = _dl_probe(url)
     use_url = final_url or url
 
     if not (total and ranges_ok and workers > 1 and total > chunk * 2):
         if show_progress:
-            print(f"  single-stream: {use_url}", file=sys.stderr)
-        _dl_stream_to(use_url, dest, chunk, on_progress, total)
+            print(f"  single-stream: {use_url}", file=sys.stderr, flush=True)
+        _dl_stream_with_resume(use_url, dest, chunk, retries, on_progress, total)
         return dest
 
     with open(dest, "wb") as f:
@@ -797,6 +915,7 @@ def stream_download(
         print(
             f"  range-split: {len(parts)} parts × {part_size / 1024 / 1024:.1f} MB → {use_url}",
             file=sys.stderr,
+            flush=True,
         )
 
     bytes_done = [0]
@@ -812,23 +931,27 @@ def stream_download(
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [
-                ex.submit(_dl_part, use_url, dest, s, e, chunk, bump, retries)
+                ex.submit(
+                    _dl_part, use_url, dest, s, e, chunk, bump, retries, timeout
+                )
                 for (s, e) in parts
             ]
             for fut in concurrent.futures.as_completed(futs):
                 fut.result()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         if show_progress:
             print(
-                "\n  range-split failed → falling back to single stream",
+                f"\n  range-split failed ({exc!r}) → falling back to "
+                "single stream with resume",
                 file=sys.stderr,
+                flush=True,
             )
         try:
             dest.unlink(missing_ok=True)
         except TypeError:
             if dest.exists():
                 dest.unlink()
-        _dl_stream_to(use_url, dest, chunk, on_progress, total)
+        _dl_stream_with_resume(use_url, dest, chunk, retries, on_progress, total)
     return dest
 
 
@@ -847,9 +970,7 @@ def download_to_workdir(
     while dest.exists():
         dest = workdir / f"{Path(name).stem}_{n}{Path(name).suffix}"
         n += 1
-    return stream_download(
-        url, dest, workers=workers, label=f"{label_prefix} {name}"
-    )
+    return stream_download(url, dest, workers=workers, label=name)
 
 
 def _resolve_roots(
@@ -884,6 +1005,7 @@ def _resolve_roots(
         for child in inp.rglob("*"):
             if child.is_file() and is_archive(child):
                 inputs.append(child)
+    _dl_emit_status("Extracting archive...", inp.name)
     return expand_input(inputs, passwords, workdir)
 
 
@@ -1114,6 +1236,7 @@ def cmd_sort(args: argparse.Namespace) -> int:
             )
             return 0
 
+        _dl_emit_status("Sorting logs...", ", ".join(keywords))
         stats = sort_logs(roots, Path(args.output), keywords)
         for k, (u, c) in stats.items():
             print(f"  {k}: {u} ulp, {c} cookies", file=sys.stderr)

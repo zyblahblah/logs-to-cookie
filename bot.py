@@ -230,23 +230,41 @@ def _zip_dir(src: Path, dest: Path) -> int:
 
 
 class _ProgressMessage:
-    """Edit a single chat message with the latest tail of the job's output."""
+    """Edit a single chat message with the latest tail of the job's output.
+
+    The CLI emits multi-line ``🌀 Status: ...`` blocks. Whenever we see a
+    line starting with ``🌀 Status:`` we treat it as the start of a fresh
+    block and discard the previous block, so the chat message stays a
+    single live tile.
+    """
 
     MIN_INTERVAL = 2.0  # seconds between edits — Telegram rate-limits hard
+    BLOCK_MARKER = "🌀 Status:"
+    MAX_BLOCK_LINES = 8
+    MAX_FALLBACK_LINES = 12
 
     def __init__(self, message, header: str) -> None:
         self.message = message
         self.header = header
         self._last = 0.0
         self._tail: List[str] = []
+        self._in_block = False
         self._lock = asyncio.Lock()
 
     async def push(self, line: str) -> None:
         line = line.rstrip()
         if not line:
             return
-        self._tail.append(line)
-        self._tail = self._tail[-10:]
+        if line.startswith(self.BLOCK_MARKER):
+            # Start a fresh status block, dropping the previous one.
+            self._tail = [line]
+            self._in_block = True
+        elif self._in_block:
+            self._tail.append(line)
+            self._tail = self._tail[-self.MAX_BLOCK_LINES :]
+        else:
+            self._tail.append(line)
+            self._tail = self._tail[-self.MAX_FALLBACK_LINES :]
         now = time.monotonic()
         if now - self._last < self.MIN_INTERVAL:
             return
@@ -260,25 +278,63 @@ class _ProgressMessage:
 
     async def _render(self, footer: str = "") -> None:
         body = "\n".join(self._tail) or "(starting…)"
-        text = f"{self.header}\n```\n{body}\n```"
+        text = f"{self.header}\n{body}"
         if footer:
-            text += f"\n{footer}"
+            text += f"\n\n{footer}"
+        # Plain text — emojis and pipe chars in the new progress block
+        # don't need markdown, and skipping it sidesteps BadRequest from
+        # stray ``_`` / ``*`` / ``[`` characters in URLs.
         try:
-            await self.message.edit_text(
-                text[-3500:], parse_mode=ParseMode.MARKDOWN
-            )
+            await self.message.edit_text(text[-3500:])
         except Exception as exc:  # noqa: BLE001 — Telegram edits often race
             log.debug("progress edit failed: %s", exc)
+
+
+# How long we let the subprocess go without producing any output before
+# we treat it as hung and kill it. Each download retry / extraction
+# stage prints something well within this window when working normally.
+SUBPROC_INACTIVITY_TIMEOUT = float(os.getenv("SUBPROC_INACTIVITY_TIMEOUT", "600"))
 
 
 async def _stream_proc(proc: asyncio.subprocess.Process, prog: _ProgressMessage) -> None:
     assert proc.stdout is not None
     buf = b""
     while True:
-        chunk = await proc.stdout.read(1024)
+        try:
+            chunk = await asyncio.wait_for(
+                proc.stdout.read(1024), timeout=SUBPROC_INACTIVITY_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "subprocess produced no output for %.0fs; killing it",
+                SUBPROC_INACTIVITY_TIMEOUT,
+            )
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await prog.push("🌀 Status: Job aborted")
+            await prog.push(
+                f"⚠️ No output for {int(SUBPROC_INACTIVITY_TIMEOUT)}s — "
+                "the worker was killed."
+            )
+            break
         if not chunk:
             break
         buf += chunk
+        # Strip ANSI cursor moves emitted by the TTY-mode progress
+        # printer (``\x1b[6A\x1b[J``); they're meaningless here.
+        while True:
+            esc = buf.find(b"\x1b[")
+            if esc < 0:
+                break
+            # Find the terminating letter (any byte in @-~ range).
+            j = esc + 2
+            while j < len(buf) and not (0x40 <= buf[j] <= 0x7E):
+                j += 1
+            if j >= len(buf):
+                break  # incomplete sequence; wait for more data
+            buf = buf[:esc] + buf[j + 1 :]
         # Split on whichever of \n or \r appears first — the downloader's
         # in-place progress bar writes \r-separated frames, so we need to
         # treat \r as a real line terminator (not a fallback after \n).
