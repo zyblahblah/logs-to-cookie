@@ -177,7 +177,7 @@ class _ProgressPrinter:
             real_elapsed = max(now - self.start, 0.0)
             speed_mb = (done / real_elapsed / 1024 / 1024) if real_elapsed > 0 else 0.0
             if total:
-                pct = 100.0 * done / total
+                pct = min(100.0, 100.0 * done / total)
                 eta = (
                     ((total - done) / (done / real_elapsed))
                     if (done and real_elapsed > 0)
@@ -303,9 +303,15 @@ def _stream_to(
     on_progress: Optional[ProgressCallback] = None,
     bytes_done_offset: int = 0,
     total: Optional[int] = None,
+    file_total: Optional[int] = None,
     append: bool = False,
 ) -> int:
-    """Single-stream download to ``dest``. Returns bytes written *here*."""
+    """Single-stream download to ``dest``. Returns bytes written *here*.
+
+    ``total`` is the bytes this request should deliver (remaining bytes when
+    resuming). ``file_total`` is the true full-file size used exclusively for
+    progress reporting so percentages stay correct across resumes.
+    """
     mode = "ab" if append else "wb"
     written = 0
     start = time.monotonic()
@@ -324,9 +330,12 @@ def _stream_to(
                 f.write(buf)
                 written += len(buf)
                 if on_progress:
-                    grand_total = (
-                        ((total or 0) + bytes_done_offset) if append else (total or 0)
-                    )
+                    # BUG FIX: Use file_total (the true full-file size) for
+                    # the progress denominator so percentages are always correct.
+                    # Previously used (total + bytes_done_offset) but total was
+                    # already reduced to (full_size - already) before being passed
+                    # in, causing the denominator to be wrong after a resume.
+                    grand_total = file_total or ((total or 0) + bytes_done_offset)
                     on_progress(
                         bytes_done_offset + written,
                         grand_total,
@@ -374,6 +383,9 @@ def _stream_with_resume(
                 on_progress=on_progress,
                 bytes_done_offset=already,
                 total=(total - already) if (total and headers) else total,
+                # Pass the full file size so progress % is always relative to
+                # the complete download, not just the remaining bytes.
+                file_total=total,
                 append=bool(headers),
             )
             return
