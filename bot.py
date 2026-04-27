@@ -385,7 +385,7 @@ async def _run_job(
             f"Job queued: /{cmd} <- {url}"
         )
         prog = _ProgressMessage(
-            progress_msg, header=f"*Running* `/{cmd}`  workers={WORKERS}"
+            progress_msg, header=f"Running /{cmd}  (workers={WORKERS})"
         )
 
         argv = _build_argv(cmd, url, passwords, keywords, out_dir)
