@@ -101,7 +101,11 @@ class _ProgressPrinter:
             if total:
                 t_mb = total / 1024 / 1024
                 pct = 100.0 * done / total
-                eta = ((total - done) / (done / elapsed)) if done else 0.0
+                eta = (
+                    ((total - done) / (done / elapsed))
+                    if (done and elapsed > 0)
+                    else 0.0
+                )
                 line = (
                     f"\r{self.label}: {mb:7.1f} / {t_mb:7.1f} MB "
                     f"({pct:5.1f}%)  {speed:6.2f} MB/s  ETA {int(eta):4d}s"
