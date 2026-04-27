@@ -685,6 +685,58 @@ def _dl_emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:
     stream.flush()
 
 
+class _Heartbeat:
+    """Background heartbeat that re-emits a status block while a long
+    synchronous step (e.g. extracting a multi-GB archive via ``7z``) is
+    running. Keeps the bot's subprocess inactivity watchdog from
+    firing on legitimately busy work that produces no output.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        detail: str = "",
+        *,
+        interval: float = 30.0,
+        stream=sys.stderr,
+    ) -> None:
+        self.stage = stage
+        self.detail = detail
+        self.interval = interval
+        self.stream = stream
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start = 0.0
+
+    def _emit(self) -> None:
+        elapsed = time.monotonic() - self._start
+        block = f"🌀 Status: {self.stage}\n"
+        if self.detail:
+            block += f"📦 {self.detail}\n"
+        block += f"⏱️ Elapsed: {_dl_fmt_eta(elapsed)}\n"
+        try:
+            self.stream.write(block)
+            self.stream.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _run(self) -> None:
+        self._emit()
+        while not self._stop.wait(self.interval):
+            self._emit()
+
+    def __enter__(self) -> "_Heartbeat":
+        self._start = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
 class _DLProgress:
     def __init__(self, label: str, stream=sys.stderr, interval: float = 1.0):
         self.label = label
@@ -1032,8 +1084,8 @@ def _resolve_roots(
         for child in inp.rglob("*"):
             if child.is_file() and is_archive(child):
                 inputs.append(child)
-    _dl_emit_status("Extracting archive...", inp.name)
-    return expand_input(inputs, passwords, workdir)
+    with _Heartbeat("Extracting archive...", inp.name):
+        return expand_input(inputs, passwords, workdir)
 
 
 def _report_failures(failures: List[Path]) -> None:
@@ -1263,8 +1315,8 @@ def cmd_sort(args: argparse.Namespace) -> int:
             )
             return 0
 
-        _dl_emit_status("Sorting logs...", ", ".join(keywords))
-        stats = sort_logs(roots, Path(args.output), keywords)
+        with _Heartbeat("Sorting logs...", ", ".join(keywords)):
+            stats = sort_logs(roots, Path(args.output), keywords)
         for k, (u, c) in stats.items():
             print(f"  {k}: {u} ulp, {c} cookies", file=sys.stderr)
         return 0

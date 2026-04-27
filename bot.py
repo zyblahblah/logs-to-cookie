@@ -323,7 +323,7 @@ class _ProgressMessage:
 # How long we let the subprocess go without producing any output before
 # we treat it as hung and kill it. Each download retry / extraction
 # stage prints something well within this window when working normally.
-SUBPROC_INACTIVITY_TIMEOUT = float(os.getenv("SUBPROC_INACTIVITY_TIMEOUT", "600"))
+SUBPROC_INACTIVITY_TIMEOUT = float(os.getenv("SUBPROC_INACTIVITY_TIMEOUT", "1800"))
 
 
 async def _stream_proc(proc: asyncio.subprocess.Process, prog: _ProgressMessage) -> None:
