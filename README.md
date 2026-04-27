@@ -12,6 +12,118 @@ people usually want:
 > incident response, your own breach exposure checks, account-takeover
 > investigations). Don't use it on data you don't have permission to process.
 
+## Telegram bot worker (Railway-ready)
+
+`bot.py` is a Telegram bot that wraps `ulp` / `cookies` / `sort` behind a
+chat flow. Send it a direct download URL, answer a couple of prompts
+(password, keywords), and it runs the same pipeline and ships the result
+back as a zip. A `Procfile` is included so it drops straight into a
+Railway *worker* process — same shape as
+[`zyblahblah/zyblahblah-ulp-to-combo`](https://github.com/zyblahblah/zyblahblah-ulp-to-combo).
+
+### Deploy on Railway
+
+1. Push this repo (or fork it) and create a new Railway project pointing
+   at it.
+2. Railway picks up `requirements.txt` (installs `python-telegram-bot`
+   plus the local `logs-to-cookie` package) and `Procfile`
+   (`worker: python bot.py`).
+3. Open the project's *Variables* tab and add:
+   * `BOT_TOKEN` — token from `@BotFather` (run `/newbot` if you don't
+     have one yet, or `/revoke` → `/token` to rotate an existing one).
+   * `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the
+     bot. The bot refuses everyone else. To find your ID, message
+     `@userinfobot` once.
+   * *(optional)* `WORKERS` — parallel range-split download workers
+     (default `4`).
+   * *(optional)* `DOC_UPLOAD_LIMIT` — max bytes the bot will upload
+     (default `52428800`, i.e. 50 MB — Telegram's standard Bot API
+     limit).
+4. Hit *Deploy*. Watch the worker logs; you should see
+   `logs-to-cookie bot vX.Y.Z starting (admins={...})`.
+
+### Using the bot
+
+In Telegram, message the bot:
+
+```
+/start
+/sort https://example.com/Black%20Logs.zip
+```
+
+It'll prompt for the archive password, then the keywords, then run the
+job and reply with `sort-result.zip`.
+
+* `/cookies <url>` — same flow but skips the keyword prompt.
+* `/ulp <url>` — same, returns a single `creds.ulp.txt` zipped up.
+* Just paste a URL with no command and the bot defaults to `/sort`.
+* `/cancel` aborts an in-progress prompt flow.
+
+> ⚠️ Never paste your bot token into a chat or commit it. If you've
+> shared the token anywhere, rotate it with `@BotFather` → `/revoke`
+> before redeploying.
+
+### `.env` flow
+
+The repo ships a [`.env.example`](./.env.example) listing every variable
+the bot reads. Copy it to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+```ini
+# .env
+BOT_TOKEN=123456:abcdef-from-botfather
+ADMIN_IDS=5376199311
+# WORKERS=4
+# DOC_UPLOAD_LIMIT=52428800
+```
+
+`.env` is already in `.gitignore`, so it'll never be committed. `bot.py`
+auto-loads it at startup via `python-dotenv` (installed by
+`requirements.txt`).
+
+When deploying to Railway, paste the **same names and values** into the
+project's *Variables* tab instead of uploading the file — Railway
+injects them as real env vars at process start, which is more secure
+than shipping a file.
+
+### Run the bot locally
+
+```bash
+pip install -r requirements.txt
+# Either populate .env (recommended)…
+cp .env.example .env  # then edit
+# …or export the vars inline:
+# export BOT_TOKEN=123456:abcdef...
+# export ADMIN_IDS=5376199311
+python bot.py
+```
+
+### How the result lands in your chat
+
+Every command finishes by zipping its output directory and sending it
+back as a Telegram document. So a `/sort https://… netflix,claude` will
+reply with `sort-result.zip` whose layout is exactly what the local CLI
+produces:
+
+```
+sort-result.zip
+└── ADMIN_@v_d_e_(1)/
+    ├── Brave_Default.txt_78e541.txt   ← Netscape cookies.txt
+    ├── Chrome_Default.txt_bccb04.txt  ← Netscape cookies.txt
+    └── creds.txt                      ← URL:USER:PASS lines
+└── ADMIN_@v_d_e_(3)/
+    └── Brave_Default.txt_d39f62.txt
+…
+```
+
+`/cookies` returns the same per-victim layout zipped up; `/ulp` returns
+a zip with a single `creds.ulp.txt`. If a result exceeds
+`DOC_UPLOAD_LIMIT` the bot sends a warning instead of a 413-ing upload.
+
 ## Direct download: hand it a URL
 
 Every command (`ulp`, `cookies`, `sort`) accepts an HTTP(S) direct-download
