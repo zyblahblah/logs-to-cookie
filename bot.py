@@ -33,6 +33,16 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+# Load a local .env file if python-dotenv is installed. Railway and other
+# hosts inject env vars directly so this is a no-op there; for local
+# development copy .env.example -> .env and fill in your values.
+try:
+    from dotenv import load_dotenv  # type: ignore[import-not-found]
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (

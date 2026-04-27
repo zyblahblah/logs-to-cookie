@@ -1,3 +1,6 @@
-# Install the local logs-to-cookie package alongside the bot's runtime dep.
+# Install the local logs-to-cookie package alongside the bot's runtime deps.
 .
 python-telegram-bot==21.5
+# Lets bot.py auto-load a local .env file. Optional but convenient for
+# local development; on Railway you set env vars in the dashboard instead.
+python-dotenv==1.0.1

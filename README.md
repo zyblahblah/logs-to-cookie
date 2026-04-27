@@ -63,14 +63,66 @@ job and reply with `sort-result.zip`.
 > shared the token anywhere, rotate it with `@BotFather` → `/revoke`
 > before redeploying.
 
+### `.env` flow
+
+The repo ships a [`.env.example`](./.env.example) listing every variable
+the bot reads. Copy it to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+```ini
+# .env
+BOT_TOKEN=123456:abcdef-from-botfather
+ADMIN_IDS=5376199311
+# WORKERS=4
+# DOC_UPLOAD_LIMIT=52428800
+```
+
+`.env` is already in `.gitignore`, so it'll never be committed. `bot.py`
+auto-loads it at startup via `python-dotenv` (installed by
+`requirements.txt`).
+
+When deploying to Railway, paste the **same names and values** into the
+project's *Variables* tab instead of uploading the file — Railway
+injects them as real env vars at process start, which is more secure
+than shipping a file.
+
 ### Run the bot locally
 
 ```bash
 pip install -r requirements.txt
-export BOT_TOKEN=123456:abcdef...
-export ADMIN_IDS=5376199311
+# Either populate .env (recommended)…
+cp .env.example .env  # then edit
+# …or export the vars inline:
+# export BOT_TOKEN=123456:abcdef...
+# export ADMIN_IDS=5376199311
 python bot.py
 ```
+
+### How the result lands in your chat
+
+Every command finishes by zipping its output directory and sending it
+back as a Telegram document. So a `/sort https://… netflix,claude` will
+reply with `sort-result.zip` whose layout is exactly what the local CLI
+produces:
+
+```
+sort-result.zip
+└── ADMIN_@v_d_e_(1)/
+    ├── Brave_Default.txt_78e541.txt   ← Netscape cookies.txt
+    ├── Chrome_Default.txt_bccb04.txt  ← Netscape cookies.txt
+    └── creds.txt                      ← URL:USER:PASS lines
+└── ADMIN_@v_d_e_(3)/
+    └── Brave_Default.txt_d39f62.txt
+…
+```
+
+`/cookies` returns the same per-victim layout zipped up; `/ulp` returns
+a zip with a single `creds.ulp.txt`. If a result exceeds
+`DOC_UPLOAD_LIMIT` the bot sends a warning instead of a 413-ing upload.
 
 ## Direct download: hand it a URL
 
