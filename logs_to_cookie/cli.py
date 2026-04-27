@@ -116,6 +116,13 @@ def cmd_ulp(args: argparse.Namespace) -> int:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
         _report_failures(failures)
+        if not roots:
+            print(
+                "error: no archives could be extracted \u2014 check the password "
+                "and that 7z/unrar is installed for AES/RAR archives.",
+                file=sys.stderr,
+            )
+            return 3
         filters = [
             f.strip().lower() for f in (args.filter or "").split(",") if f.strip()
         ]
@@ -164,6 +171,13 @@ def cmd_cookies(args: argparse.Namespace) -> int:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
         _report_failures(failures)
+        if not roots:
+            print(
+                "error: no archives could be extracted \u2014 check the password "
+                "and that 7z/unrar is installed for AES/RAR archives.",
+                file=sys.stderr,
+            )
+            return 3
         filters = [
             f.strip().lower() for f in (args.filter or "").split(",") if f.strip()
         ]
@@ -314,6 +328,13 @@ def cmd_sort(args: argparse.Namespace) -> int:
             print(f"input not found: {args.input}", file=sys.stderr)
             return 2
         _report_failures(failures)
+        if not roots:
+            print(
+                "error: no archives could be extracted \u2014 check the password "
+                "and that 7z/unrar is installed for AES/RAR archives.",
+                file=sys.stderr,
+            )
+            return 3
         keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
         if not keywords:
             print("provide --keywords", file=sys.stderr)
