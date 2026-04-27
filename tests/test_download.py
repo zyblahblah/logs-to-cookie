@@ -307,3 +307,55 @@ def test_resume_does_not_corrupt_when_total_unknown(tmp_path, monkeypatch):
         "output corrupted — got partial bytes prepended to a fresh full "
         "download"
     )
+
+
+def test_progress_uses_real_elapsed_after_resume():
+    """`_ProgressPrinter` must compute elapsed from its own monotonic
+    origin, not the caller's per-attempt timer. Otherwise after a
+    resume the speed/ETA would be computed against just the current
+    attempt's seconds while ``done`` includes bytes from prior
+    attempts — producing wildly inflated speed numbers.
+    """
+    import io
+    import time as _t
+    from logs_to_cookie.download import _ProgressPrinter
+
+    stream = io.StringIO()
+    p = _ProgressPrinter("blob.bin", stream=stream, interval=0)
+    # Backdate the printer's start by 10 seconds (simulates: a prior
+    # attempt downloaded 5 MB, then we retry and the caller passes
+    # elapsed=0.001 because the new attempt just started).
+    p.start = _t.monotonic() - 10.0
+    p(done=5 * 1024 * 1024, total=10 * 1024 * 1024, elapsed=0.001)
+
+    out = stream.getvalue()
+    # If we used the caller's elapsed=0.001, speed would be ~5000 MB/s.
+    # With the real elapsed (~10s), it's ~0.5 MB/s.
+    import re
+    m = re.search(r"Speed: ([\d.]+) MB/s", out)
+    assert m, out
+    speed = float(m.group(1))
+    assert speed < 5.0, (
+        f"speed {speed} MB/s is implausibly high — "
+        "elapsed timer is using caller's per-attempt value"
+    )
+
+
+def test_progress_block_lines_track_actual_count():
+    """Unknown-total branch emits a 5-line block; known-total emits 6.
+    The redraw must use the previous block's actual line count so it
+    doesn't erase real output above when total flips.
+    """
+    import io
+    from logs_to_cookie.download import _ProgressPrinter
+
+    stream = io.StringIO()
+    stream.isatty = lambda: True  # type: ignore[attr-defined]
+    p = _ProgressPrinter("blob.bin", stream=stream, interval=0)
+    p(done=1024, total=0, elapsed=1.0)  # unknown total → 5 lines
+    p(done=2048, total=0, elapsed=2.0)  # second draw should erase 5
+
+    out = stream.getvalue()
+    # The cursor-up escape between blocks must reference 5, not 6.
+    assert "\x1b[5A\x1b[J" in out, out
+    assert "\x1b[6A\x1b[J" not in out, out

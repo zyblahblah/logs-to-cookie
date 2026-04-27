@@ -143,8 +143,6 @@ class _ProgressPrinter:
     terminal we use ANSI cursor moves to overwrite in place.
     """
 
-    BLOCK_LINES = 6
-
     def __init__(self, label: str, stream=sys.stderr, interval: float = 1.0):
         self.label = label
         self.stream = stream
@@ -153,7 +151,11 @@ class _ProgressPrinter:
         self.last = 0.0
         self._lock = threading.Lock()
         self._isatty = bool(getattr(stream, "isatty", lambda: False)())
-        self._printed = False
+        # Lines emitted by the previous block. Used to drive the ANSI
+        # cursor-up redraw — must match the *actual* line count of the
+        # last block (which differs depending on whether ``total`` was
+        # known), otherwise we'd erase real output above us.
+        self._prev_lines = 0
 
     def __call__(self, done: int, total: int, elapsed: float) -> None:
         now = time.monotonic()
@@ -162,16 +164,23 @@ class _ProgressPrinter:
             if (
                 now - self.last < self.interval
                 and not done_final
-                and self._printed
+                and self._prev_lines
             ):
                 return
             self.last = now
-            speed_mb = (done / elapsed / 1024 / 1024) if elapsed > 0 else 0.0
+            # Use the printer's own monotonic origin instead of the
+            # caller's per-attempt timer. ``_stream_to`` resets its
+            # local ``start`` on every retry but reports cumulative
+            # ``done`` (including ``bytes_done_offset``), which would
+            # otherwise produce wildly inflated speed and a too-rosy
+            # ETA right after a resume.
+            real_elapsed = max(now - self.start, 0.0)
+            speed_mb = (done / real_elapsed / 1024 / 1024) if real_elapsed > 0 else 0.0
             if total:
                 pct = 100.0 * done / total
                 eta = (
-                    ((total - done) / (done / elapsed))
-                    if (done and elapsed > 0)
+                    ((total - done) / (done / real_elapsed))
+                    if (done and real_elapsed > 0)
                     else 0.0
                 )
                 block = (
@@ -180,7 +189,7 @@ class _ProgressPrinter:
                     f"📊 [{_bar(pct)}] {pct:.1f}%\n"
                     f"📡 Progress: {_fmt_size(done)} / {_fmt_size(total)}\n"
                     f"⚡ Speed: {speed_mb:.2f} MB/s | ETA: {_fmt_eta(eta)}\n"
-                    f"⏱️ Elapsed: {_fmt_eta(elapsed)}\n"
+                    f"⏱️ Elapsed: {_fmt_eta(real_elapsed)}\n"
                 )
             else:
                 block = (
@@ -188,14 +197,17 @@ class _ProgressPrinter:
                     f"📦 {self.label}\n"
                     f"📡 Progress: {_fmt_size(done)}\n"
                     f"⚡ Speed: {speed_mb:.2f} MB/s\n"
-                    f"⏱️ Elapsed: {_fmt_eta(elapsed)}\n"
+                    f"⏱️ Elapsed: {_fmt_eta(real_elapsed)}\n"
                 )
-            if self._isatty and self._printed:
-                # Wipe the previous block so we render in place.
-                self.stream.write(f"\x1b[{self.BLOCK_LINES}A\x1b[J")
+            line_count = block.count("\n")
+            if self._isatty and self._prev_lines:
+                # Wipe the previous block so we render in place. Use
+                # the previous block's actual line count, not a hard-
+                # coded constant — the unknown-total branch is shorter.
+                self.stream.write(f"\x1b[{self._prev_lines}A\x1b[J")
             self.stream.write(block)
             self.stream.flush()
-            self._printed = True
+            self._prev_lines = line_count
 
 
 def emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:

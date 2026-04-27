@@ -686,8 +686,6 @@ def _dl_emit_status(stage: str, detail: str = "", stream=sys.stderr) -> None:
 
 
 class _DLProgress:
-    BLOCK_LINES = 6
-
     def __init__(self, label: str, stream=sys.stderr, interval: float = 1.0):
         self.label = label
         self.stream = stream
@@ -696,7 +694,11 @@ class _DLProgress:
         self.last = 0.0
         self._lock = threading.Lock()
         self._isatty = bool(getattr(stream, "isatty", lambda: False)())
-        self._printed = False
+        # Lines emitted by the previous block; used to drive the ANSI
+        # cursor-up redraw. Tracks the actual line count so the
+        # unknown-total branch (5 lines) doesn't erase output above us
+        # when redrawing.
+        self._prev_lines = 0
 
     def __call__(self, done: int, total: int, elapsed: float) -> None:
         now = time.monotonic()
@@ -705,16 +707,23 @@ class _DLProgress:
             if (
                 now - self.last < self.interval
                 and not done_final
-                and self._printed
+                and self._prev_lines
             ):
                 return
             self.last = now
-            speed_mb = (done / elapsed / 1024 / 1024) if elapsed > 0 else 0.0
+            # Use our own monotonic origin instead of the caller's
+            # per-attempt timer. ``_dl_stream_to`` resets its local
+            # ``start`` on every retry but reports cumulative ``done``
+            # (incl. ``bytes_done_offset``), which would otherwise
+            # produce a wildly inflated speed and a too-rosy ETA right
+            # after a resume.
+            real_elapsed = max(now - self.start, 0.0)
+            speed_mb = (done / real_elapsed / 1024 / 1024) if real_elapsed > 0 else 0.0
             if total:
                 pct = 100.0 * done / total
                 eta = (
-                    ((total - done) / (done / elapsed))
-                    if (done and elapsed > 0)
+                    ((total - done) / (done / real_elapsed))
+                    if (done and real_elapsed > 0)
                     else 0.0
                 )
                 block = (
@@ -723,7 +732,7 @@ class _DLProgress:
                     f"📊 [{_dl_bar(pct)}] {pct:.1f}%\n"
                     f"📡 Progress: {_dl_fmt_size(done)} / {_dl_fmt_size(total)}\n"
                     f"⚡ Speed: {speed_mb:.2f} MB/s | ETA: {_dl_fmt_eta(eta)}\n"
-                    f"⏱️ Elapsed: {_dl_fmt_eta(elapsed)}\n"
+                    f"⏱️ Elapsed: {_dl_fmt_eta(real_elapsed)}\n"
                 )
             else:
                 block = (
@@ -731,13 +740,16 @@ class _DLProgress:
                     f"📦 {self.label}\n"
                     f"📡 Progress: {_dl_fmt_size(done)}\n"
                     f"⚡ Speed: {speed_mb:.2f} MB/s\n"
-                    f"⏱️ Elapsed: {_dl_fmt_eta(elapsed)}\n"
+                    f"⏱️ Elapsed: {_dl_fmt_eta(real_elapsed)}\n"
                 )
-            if self._isatty and self._printed:
-                self.stream.write(f"\x1b[{self.BLOCK_LINES}A\x1b[J")
+            line_count = block.count("\n")
+            if self._isatty and self._prev_lines:
+                # Move up by the *previous* block's line count, not a
+                # hard-coded constant.
+                self.stream.write(f"\x1b[{self._prev_lines}A\x1b[J")
             self.stream.write(block)
             self.stream.flush()
-            self._printed = True
+            self._prev_lines = line_count
 
 
 def _dl_stream_to(
