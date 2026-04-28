@@ -66,10 +66,12 @@ def _try_7z(
             r = subprocess.run(
                 cmd,
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=600,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return False
         if r.returncode == 0:
             return True
@@ -91,10 +93,12 @@ def _try_unrar(
             r = subprocess.run(
                 cmd,
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=600,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return False
         if r.returncode == 0:
             return True

@@ -42,6 +42,15 @@ def test_parse_netscape_line_skips_comments_and_blank():
     assert P.parse_netscape_line("   ") is None
 
 
+def test_parse_netscape_line_handles_httponly_prefix():
+    line = "#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1\tsess\tdeadbeef"
+    c = P.parse_netscape_line(line)
+    assert c is not None
+    assert c["domain"] == ".example.com"
+    assert c["name"] == "sess"
+    assert c["value"] == "deadbeef"
+
+
 def test_parse_netscape_line_rejects_bad_format():
     assert P.parse_netscape_line("not a cookie") is None
     assert P.parse_netscape_line("only one field") is None

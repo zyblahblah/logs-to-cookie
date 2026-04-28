@@ -143,7 +143,13 @@ def parse_netscape_line(line: str) -> Optional[dict]:
     with the named fields when the line matches; otherwise ``None``.
     """
     s = line.strip()
-    if not s or s.startswith("#"):
+    if not s:
+        return None
+    # `#HttpOnly_` is a standard Netscape extension used by Firefox / curl
+    # to mark HTTPOnly cookies. Strip the prefix and parse the rest.
+    if s.startswith("#HttpOnly_"):
+        s = s[len("#HttpOnly_"):]
+    elif s.startswith("#"):
         return None
     m = _NETSCAPE_RE.match(s)
     if not m:
