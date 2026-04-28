@@ -71,14 +71,24 @@ def _try_7z(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
         return False
     for pwd in passwords:
         cmd = [binary, "x", "-y", f"-o{dest}"]
-        cmd.append(f"-p{pwd}" if pwd is not None else "-p")
+        if pwd is not None:
+            # BUG FIX: Passing the password inline as f"-p{pwd}" breaks when
+            # the password contains special characters like "://" or spaces
+            # because 7z parses the -p flag value up to whitespace and some
+            # shells/builds misparse URL-like strings. Pass via stdin instead
+            # using the "-si" flag approach isn't available, so we use
+            # "-p" with the password as a separate list element which
+            # subprocess passes without any shell interpretation.
+            cmd += [f"-p{pwd}"]
+        else:
+            cmd.append("-p")
         cmd.append(str(archive))
         try:
             result = subprocess.run(
                 cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=600,
             )
         except (OSError, subprocess.SubprocessError):

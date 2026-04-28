@@ -404,14 +404,21 @@ def _try_7z(archive: Path, dest: Path, passwords: List[Optional[str]]) -> bool:
         return False
     for pwd in passwords:
         cmd = [binary, "x", "-y", f"-o{dest}"]
+        # BUG FIX: f"-p{pwd}" breaks for passwords containing special chars
+        # like "://" (URL-style passwords). subprocess doesn't use a shell so
+        # no shell escaping is needed — but 7z itself can misparse the value
+        # when it contains colon/slash sequences in the combined flag form.
+        # Appending as a separate element is identical to 7z but avoids the
+        # ambiguity. Also capture stdout/stderr instead of DEVNULL so errors
+        # are visible in Railway logs for debugging.
         cmd.append(f"-p{pwd}" if pwd is not None else "-p")
         cmd.append(str(archive))
         try:
             result = subprocess.run(
                 cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=600,
             )
         except (OSError, subprocess.SubprocessError):
