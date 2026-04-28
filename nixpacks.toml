@@ -1,6 +1,5 @@
-# nixpacks.toml — Railway build configuration
-# Installs system packages needed for archive extraction.
-# p7zip handles encrypted .zip and .7z files.
-# unrar handles encrypted .rar files.
+# Railway build configuration.
+# p7zip handles encrypted .zip and .7z archives.
+# unrar handles encrypted .rar archives.
 [phases.setup]
 nixPkgs = ["p7zip", "unrar"]
