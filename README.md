@@ -14,10 +14,10 @@ PROCESS              └─► Chunked download (64 KB at a time)
                           └─► Parse & extract cookies
                                └─► Convert to Netscape format
                                     └─► One file per cookie set
-OUTPUT                                  └─► If size ≤ Telegram limit:
-                                              send zip directly
-                                              else: host file & send
-                                                    direct download URL
+OUTPUT                                  └─► Bot uploads cookies_result.zip
+                                              (or stops with an error
+                                               if it exceeds the
+                                               Telegram bot upload limit)
 FEEDBACK   ⏳ Downloading... ▓▓░░  ⚙ Processing...  🔄 Converting...
             ✅ Done!  /  ❌ Error
 ```
@@ -29,7 +29,7 @@ FEEDBACK   ⏳ Downloading... ▓▓░░  ⚙ Processing...  🔄 Converting..
 | **START** | User sends `/start`. The bot greets them and asks for a *direct download URL* to the logs. |
 | **INPUT** | The bot collects three things in sequence: the URL, an archive password (skippable), and an optional keyword filter (skippable). |
 | **PROCESS** | The bot streams the URL in 64 KB chunks. Archive URLs (`.zip`, `.7z`, `.rar`) are extracted with the supplied password; every cookie file inside is parsed. Each detected *cookie set* (one per source file) is emitted as its own Netscape `.txt` file. |
-| **OUTPUT** | Every output `.txt` is bundled into `cookies_result.zip`. If the zip is small enough for Telegram (50 MB default), the bot uploads it directly. If it exceeds the limit, the bot serves it from the built-in HTTP file host and sends a direct download URL instead. |
+| **OUTPUT** | Every output `.txt` is bundled into `cookies_result.zip` and uploaded as a Telegram document. If the zip exceeds Telegram's 50 MB bot upload limit, the bot stops with a clear error and asks the user to re-run with a stricter keyword filter. |
 | **FEEDBACK** | The bot edits a single status message throughout: `⏳ Downloading...` with a progress bar, `⚙ Processing...`, `🔄 Converting...`, and finally `✅ Done!` or `❌ Error <reason>`. |
 
 You can send `/cancel` at any prompt to abort the current job.
@@ -66,7 +66,6 @@ sudo apt-get install -y p7zip-full unrar
 2. Open *Variables* and set:
    - `BOT_TOKEN` — token from [@BotFather](https://t.me/BotFather)
    - `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended).
-   - `PUBLIC_BASE_URL` — public URL of the Railway service (e.g. `https://logs-to-cookie.up.railway.app`). Used in the direct download links the bot sends when the result zip is too large for Telegram.
 3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `nixpacks.toml` installs `p7zip` and `unrar` so encrypted archives work out of the box.
 
 > **Rotate your token.** Anyone who has seen your bot token can
@@ -81,11 +80,8 @@ See [`.env.example`](.env.example) for the full list:
 
 - `BOT_TOKEN` *(required)* — from BotFather.
 - `ADMIN_IDS` — comma-separated allow-list of Telegram user IDs.
-- `DOC_UPLOAD_LIMIT` *(bytes, default 52428800)* — anything bigger gets hosted instead of uploaded directly.
+- `DOC_UPLOAD_LIMIT` *(bytes, default 52428800)* — result zips larger than this make the bot stop with a clear error message instead of uploading.
 - `MAX_DOWNLOAD_BYTES` *(bytes, default 5368709120)* — refuses inputs larger than this.
-- `WEBSERVER_HOST`, `WEBSERVER_PORT` — bind address for the built-in file host (default `0.0.0.0:8080`).
-- `PUBLIC_BASE_URL` — public base URL the bot uses when handing out direct download links. Leave empty to auto-build it from `WEBSERVER_HOST:WEBSERVER_PORT` (only useful for local testing).
-- `RESULT_TTL_SECONDS` *(default 3600)* — how long hosted result files stay reachable before being swept.
 
 ## How it works
 

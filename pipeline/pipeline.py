@@ -8,7 +8,7 @@ The flow mirrors the diagram in the README:
                   └─► keywords?  (optional case-insensitive filter)
                        └─► parse + extract cookies
                             └─► one Netscape file per "cookie set"
-                                 └─► zip → bot or hosted download URL
+                                 └─► zip → uploaded by the bot
 """
 
 from __future__ import annotations

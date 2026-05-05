@@ -9,10 +9,10 @@ Implements the interactive flow shown in
                  └─► Bot asks for keywords to filter on (or /skip)
                       └─► Pipeline runs (chunked download → parse →
                           convert → 1 file per cookie set → zip)
-                           └─► Bot returns the zip directly, or a
-                               hosted download link if the zip is
-                               too large for Telegram's bot upload
-                               limit.
+                           └─► Bot returns the zip directly. If the
+                               zip is bigger than Telegram's bot upload
+                               limit (50 MB by default), the bot stops
+                               with a clear error.
 
 Run as ``worker: python bot.py``. ``BOT_TOKEN`` and ``ADMIN_IDS`` are
 read from the environment (or a local ``.env`` file).
@@ -21,7 +21,6 @@ read from the environment (or a local ``.env`` file).
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import os
 import shutil
@@ -44,7 +43,6 @@ from telegram.ext import (
 )
 
 from pipeline import is_archive_url, run_pipeline
-from webserver import FileHost, from_env as webserver_from_env
 
 load_dotenv()
 
@@ -131,32 +129,6 @@ def _split_keywords(text: str) -> list[str]:
             if sub:
                 parts.append(sub)
     return parts
-
-
-def _format_hosted_link_message(
-    *,
-    download_url: str,
-    ttl_min: int,
-    zip_size: int,
-    cookie_set_count: int,
-    cookie_count: int,
-) -> str:
-    """Build the *hosted download link* message body.
-
-    HTML parse mode is used (instead of Markdown) because the download
-    URL embeds a token + ``cookies_result.zip`` whose underscores would
-    otherwise be interpreted as italic markers and rejected by Telegram
-    with ``BadRequest: Can't parse entities``.
-    """
-    safe_url = html.escape(download_url, quote=False)
-    return (
-        f"✅ <b>Done!</b>\n"
-        f"Direct download link (valid ~{ttl_min} min):\n"
-        f"{safe_url}\n\n"
-        f"📦 {_human_bytes(zip_size)} — "
-        f"{cookie_set_count} cookie set(s), "
-        f"{cookie_count} cookies"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -344,73 +316,41 @@ async def _run_job(
 
         zip_size = result.zip_path.stat().st_size
 
-        # ---------- decision: send file or hosted link ----------
-        host: Optional[FileHost] = context.bot_data.get("file_host")
-
-        if zip_size <= DOC_UPLOAD_LIMIT:
+        if zip_size > DOC_UPLOAD_LIMIT:
             await _edit(
-                "📤 Uploading result...\n"
+                f"❌ Result zip is too large for Telegram "
+                f"({_human_bytes(zip_size)} > "
+                f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
                 f"📦 {len(result.cookie_files)} cookie set(s) — "
                 f"{result.cookie_count} cookies\n"
-                f"📡 zip: {_human_bytes(zip_size)}\n"
-                f"⏱️ Elapsed: {elapsed}s"
-            )
-            with open(result.zip_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    filename=result.zip_path.name,
-                    caption=(
-                        f"✅ {len(result.cookie_files)} cookie set(s) — "
-                        f"{result.cookie_count} cookies\n"
-                        f"📡 read: {_human_bytes(result.bytes_read)}\n"
-                        f"⏱️ {elapsed}s"
-                    ),
-                )
-            await _edit(
-                f"✅ Done! Sent {_human_bytes(zip_size)} "
-                f"({len(result.cookie_files)} sets, "
-                f"{result.cookie_count} cookies)."
-            )
-            return
-
-        # zip too large — fall back to a hosted download link.
-        if host is None:
-            await _edit(
-                "⚠️ Result zip too large for Telegram upload, and the "
-                "built-in file host is disabled.\n"
-                f"📦 {len(result.cookie_files)} cookie set(s)\n"
-                f"📡 zip: {_human_bytes(zip_size)} > limit "
-                f"{_human_bytes(DOC_UPLOAD_LIMIT)}"
+                "Tip: re-run with a stricter keyword filter to shrink "
+                "the result."
             )
             return
 
         await _edit(
-            "📤 Result is too large for Telegram. Hosting it for you...\n"
-            f"📦 {_human_bytes(zip_size)} — "
-            f"{len(result.cookie_files)} cookie set(s), "
-            f"{result.cookie_count} cookies"
+            "📤 Uploading result...\n"
+            f"📦 {len(result.cookie_files)} cookie set(s) — "
+            f"{result.cookie_count} cookies\n"
+            f"📡 zip: {_human_bytes(zip_size)}\n"
+            f"⏱️ Elapsed: {elapsed}s"
         )
-        download_url = host.host_file(
-            result.zip_path,
-            filename="cookies_result.zip",
-        )
-        ttl_min = max(1, host.ttl_seconds // 60)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=_format_hosted_link_message(
-                download_url=download_url,
-                ttl_min=ttl_min,
-                zip_size=zip_size,
-                cookie_set_count=len(result.cookie_files),
-                cookie_count=result.cookie_count,
-            ),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        with open(result.zip_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=result.zip_path.name,
+                caption=(
+                    f"✅ {len(result.cookie_files)} cookie set(s) — "
+                    f"{result.cookie_count} cookies\n"
+                    f"📡 read: {_human_bytes(result.bytes_read)}\n"
+                    f"⏱️ {elapsed}s"
+                ),
+            )
         await _edit(
-            f"✅ Done! Hosted {_human_bytes(zip_size)} — "
-            f"see the download link above."
+            f"✅ Done! Sent {_human_bytes(zip_size)} "
+            f"({len(result.cookie_files)} sets, "
+            f"{result.cookie_count} cookies)."
         )
     finally:
         context.user_data.clear()
@@ -420,27 +360,6 @@ async def _run_job(
 # ---------------------------------------------------------------------------
 # Wiring
 # ---------------------------------------------------------------------------
-async def _post_init(app: Application) -> None:
-    spool_dir = Path(tempfile.gettempdir()) / "logs2cookie-host"
-    server, base = webserver_from_env(spool_dir)
-    try:
-        await server.start()
-        app.bot_data["file_host"] = server
-        log.info("hosted-result base URL = %s", base)
-    except OSError as exc:
-        log.warning(
-            "failed to start file host (%s) — oversized results will "
-            "not be deliverable until this is fixed.",
-            exc,
-        )
-
-
-async def _post_shutdown(app: Application) -> None:
-    server: Optional[FileHost] = app.bot_data.get("file_host")
-    if server is not None:
-        await server.stop()
-
-
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise SystemExit(
@@ -448,13 +367,7 @@ def build_app() -> Application:
             "provider's environment variables."
         )
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[
