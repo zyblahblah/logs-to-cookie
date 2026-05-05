@@ -66,7 +66,16 @@ sudo apt-get install -y p7zip-full unrar
 2. Open *Variables* and set:
    - `BOT_TOKEN` — token from [@BotFather](https://t.me/BotFather)
    - `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended).
-3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `nixpacks.toml` installs `p7zip` and `unrar` so encrypted archives work out of the box.
+3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `railpack.json` installs `p7zip-full` + `unrar` (via apt in the deploy image) so encrypted archives work out of the box; `nixpacks.toml` is also kept around for older Railway services / self-hosters that build with Nixpacks.
+
+> **Heads up — Railway uses Railpack, not Nixpacks, by default since
+> mid-2025.** That's why an earlier version of this README (which only
+> shipped `nixpacks.toml`) deployed fine but failed at runtime with
+> `❌ Error: 7z binary not found — install p7zip on your host.`.
+> Railpack ignores `nixpacks.toml` entirely; it reads `railpack.json`.
+> If you've forked an older copy, copy
+> [`railpack.json`](./railpack.json) into the root of your repo and
+> redeploy.
 
 > **Rotate your token.** Anyone who has seen your bot token can
 > control the bot. If you've ever pasted it in chat, run
