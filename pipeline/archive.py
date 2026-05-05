@@ -1,8 +1,10 @@
 """Archive extraction helpers (zip / 7z / rar).
 
-Encrypted archives are supported as long as the corresponding
-unpacker is on ``$PATH`` (``7z``, ``7za``, ``7zz`` for zip/7z and
-``unrar`` for rar archives).
+All three archive types route through ``7z`` (from ``p7zip-full``) —
+recent versions of p7zip support both RAR4 and RAR5 archives in
+addition to zip and 7z, including encryption. The proprietary ``unrar``
+binary is checked as a fallback for RAR archives, but is no longer
+required — it's not available on Railway's Railpack runtime image.
 
 The bot accepts CDN URLs that don't carry an ``.zip``/``.7z``/``.rar``
 suffix in their path (e.g. tokenised LinkForge / file-host URLs), so
@@ -113,38 +115,40 @@ def extract_archive(
             "(magic bytes don't match zip/7z/rar)"
         )
 
-    if kind in ("zip", "7z"):
+    if kind in ("zip", "7z", "rar"):
         bin_path = _which_first(SEVENZIP_BINARIES)
         if bin_path is None:
-            raise ArchiveError(
-                "7z binary not found — install p7zip on your host."
+            # Last-resort fallback: ``unrar`` only handles ``.rar``.
+            unrar_path = (
+                _which_first(UNRAR_BINARIES) if kind == "rar" else None
             )
-        cmd = [
-            bin_path,
-            "x",
-            "-y",
-            f"-o{dest_dir}",
-            str(archive_path),
-        ]
-        if password is not None and password != "":
-            cmd.insert(2, f"-p{password}")
+            if unrar_path is None:
+                raise ArchiveError(
+                    "7z binary not found — install p7zip-full on "
+                    "your host (it handles zip, 7z, and rar)."
+                )
+            cmd = [unrar_path, "x", "-y"]
+            if password is not None and password != "":
+                cmd.append(f"-p{password}")
+            else:
+                cmd.append("-p-")
+            cmd += [str(archive_path), str(dest_dir) + "/"]
         else:
-            # Use a non-empty placeholder so 7z fails fast on encrypted
-            # archives instead of hanging on the interactive prompt.
-            cmd.insert(2, "-p-")
-    elif kind == "rar":
-        bin_path = _which_first(UNRAR_BINARIES)
-        if bin_path is None:
-            raise ArchiveError(
-                "unrar binary not found — install unrar on your host."
-            )
-        cmd = [bin_path, "x", "-y"]
-        if password is not None and password != "":
-            cmd.append(f"-p{password}")
-        else:
-            cmd.append("-p-")
-        cmd += [str(archive_path), str(dest_dir) + "/"]
-    else:  # pragma: no cover — guarded by archive_kind() above
+            cmd = [
+                bin_path,
+                "x",
+                "-y",
+                f"-o{dest_dir}",
+                str(archive_path),
+            ]
+            if password is not None and password != "":
+                cmd.insert(2, f"-p{password}")
+            else:
+                # Use a non-empty placeholder so 7z fails fast on
+                # encrypted archives instead of hanging on the
+                # interactive prompt.
+                cmd.insert(2, "-p-")
+    else:  # pragma: no cover — guarded by detect_archive_kind() above
         raise ArchiveError(f"unsupported archive type: {kind}")
 
     log.info("extracting %s -> %s (kind=%s)", archive_path, dest_dir, kind)
