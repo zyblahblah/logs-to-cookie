@@ -3,6 +3,11 @@
 Encrypted archives are supported as long as the corresponding
 unpacker is on ``$PATH`` (``7z``, ``7za``, ``7zz`` for zip/7z and
 ``unrar`` for rar archives).
+
+The bot accepts CDN URLs that don't carry an ``.zip``/``.7z``/``.rar``
+suffix in their path (e.g. tokenised LinkForge / file-host URLs), so
+:func:`detect_archive_kind` sniffs the file's magic bytes before
+falling back to the suffix.
 """
 
 from __future__ import annotations
@@ -17,6 +22,18 @@ from urllib.parse import urlparse
 log = logging.getLogger(__name__)
 
 ARCHIVE_SUFFIXES: tuple[str, ...] = (".zip", ".7z", ".rar")
+
+# Magic byte signatures, in (kind, prefix) tuples. ZIP has three valid
+# leading records (local file header, end-of-central-directory record,
+# data descriptor) so we list all three. RAR4 and RAR5 share the
+# leading ``Rar!\x1a\x07`` so a single 7-byte prefix covers both.
+MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
+    ("zip", b"PK\x03\x04"),
+    ("zip", b"PK\x05\x06"),
+    ("zip", b"PK\x07\x08"),
+    ("7z", b"7z\xbc\xaf\x27\x1c"),
+    ("rar", b"Rar!\x1a\x07"),
+)
 
 # All 7z-family binaries the bot will accept. ``7z`` is the canonical
 # one on Linux nixpkgs; macOS Homebrew installs ``7zz``.
@@ -43,6 +60,29 @@ def archive_kind(path: Path) -> Optional[str]:
     return None
 
 
+def _read_magic_header(path: Path, n: int = 8) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read(n)
+    except OSError:
+        return b""
+
+
+def detect_archive_kind(path: Path) -> Optional[str]:
+    """Return the archive kind for ``path`` (``"zip"``/``"7z"``/``"rar"``).
+
+    Magic bytes are checked first so the bot accepts archives served
+    behind opaque CDN URLs (no ``.zip``/``.7z``/``.rar`` suffix in the
+    URL path). The on-disk filename suffix is consulted as a fallback
+    only when the file is empty / unreadable / not-yet-downloaded.
+    """
+    header = _read_magic_header(path)
+    for kind, prefix in MAGIC_SIGNATURES:
+        if header.startswith(prefix):
+            return kind
+    return archive_kind(path)
+
+
 def _which_first(candidates: Sequence[str]) -> Optional[str]:
     for c in candidates:
         path = shutil.which(c)
@@ -61,11 +101,17 @@ def extract_archive(
     """Extract ``archive_path`` into ``dest_dir`` (created if needed).
 
     Returns ``dest_dir``. Raises :class:`ArchiveError` on any failure.
+    The archive type is detected from magic bytes first and the file
+    extension second — the bot routinely sees archives behind tokenised
+    CDN URLs that have no extension at all.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    kind = archive_kind(archive_path)
+    kind = detect_archive_kind(archive_path)
     if kind is None:
-        raise ArchiveError(f"unsupported archive type: {archive_path.name}")
+        raise ArchiveError(
+            f"unsupported archive type: {archive_path.name} "
+            "(magic bytes don't match zip/7z/rar)"
+        )
 
     if kind in ("zip", "7z"):
         bin_path = _which_first(SEVENZIP_BINARIES)

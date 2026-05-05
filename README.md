@@ -28,7 +28,7 @@ FEEDBACK   ⏳ Downloading... ▓▓░░  ⚙ Processing...  🔄 Converting..
 |---|---|
 | **START** | User sends `/start`. The bot greets them and asks for a *direct download URL* to the logs. |
 | **INPUT** | The bot collects three things in sequence: the URL, an archive password (skippable), and an optional keyword filter (skippable). |
-| **PROCESS** | The bot streams the URL in 64 KB chunks. Archive URLs (`.zip`, `.7z`, `.rar`) are extracted with the supplied password; every cookie file inside is parsed. Each detected *cookie set* (one per source file) is emitted as its own Netscape `.txt` file. |
+| **PROCESS** | The bot streams the URL in 64 KB chunks to a temp file, then sniffs the first few bytes to detect zip/7z/rar (so tokenised CDN URLs without `.zip`/`.7z`/`.rar` in the path also work). Archives are extracted with the supplied password; every cookie file inside is parsed. Each detected *cookie set* (one per source file) is emitted as its own Netscape `.txt` file. |
 | **OUTPUT** | Every output `.txt` is bundled into `cookies_result.zip` and uploaded as a Telegram document. If the zip exceeds Telegram's 50 MB bot upload limit, the bot stops with a clear error and asks the user to re-run with a stricter keyword filter. |
 | **FEEDBACK** | The bot edits a single status message throughout: `⏳ Downloading...` with a progress bar, `⚙ Processing...`, `🔄 Converting...`, and finally `✅ Done!` or `❌ Error <reason>`. |
 
@@ -85,14 +85,14 @@ See [`.env.example`](.env.example) for the full list:
 
 ## How it works
 
-1. **Streaming.** `requests.get(stream=True)` pulls 64 KB at a time. Plain `.txt` URLs are decoded and line-buffered straight into the parser; archive URLs are streamed straight into a temp file before extraction.
+1. **Streaming.** `requests.get(stream=True)` pulls 64 KB at a time straight into a temp file on disk — the body is never buffered in RAM and the file is what we sniff for the archive type.
 2. **Line buffer.** Chunks are decoded as UTF-8 (errors replaced) and split on `\n`. Trailing partial lines are stitched onto the next chunk so cookie rows split across chunk boundaries are never lost.
-3. **Extraction.** `.zip`/`.7z` archives are unpacked with `7z x` (handles encryption); `.rar` archives with `unrar x` (handles encryption). The bot fails fast on a wrong password.
+3. **Detection + extraction.** The first 8 bytes of the saved file are matched against ZIP (`PK\x03\x04` / `PK\x05\x06` / `PK\x07\x08`), 7Z (`7z\xbc\xaf\x27\x1c`) and RAR (`Rar!\x1a\x07`) signatures, so URLs like `https://cdn2.linkforge.xyz/download/AgAD0w22104` (no extension) work just fine. `.zip`/`.7z` archives are then unpacked with `7z x` (handles encryption); `.rar` archives with `unrar x` (handles encryption). The bot fails fast on a wrong password.
 4. **Parse.** Every line that matches the 7-column Netscape cookie format (`domain TAB flag TAB path TAB secure TAB expires TAB name TAB value`) is kept. Comments and malformed lines are silently dropped. The `#HttpOnly_` prefix is preserved on the domain column.
 5. **Filter.** If keywords were provided, a row is only kept when its raw line contains at least one of them (case-insensitive).
 6. **Per-set output.** For archive inputs, every detected cookie file in the archive becomes its own `NNNN_<source-path>.txt` Netscape file. For plain-text URLs, the entire stream is one cookie set → one output file.
 7. **Package.** All output files are bundled into `cookies_result.zip` with `ZIP_DEFLATED` (`compresslevel=1`).
-8. **Deliver.** If `cookies_result.zip` ≤ `DOC_UPLOAD_LIMIT`, the bot uploads it via `bot.send_document()`. Otherwise the zip is copied into the built-in file host's spool directory and the user gets a tokenised direct download URL valid for `RESULT_TTL_SECONDS`.
+8. **Deliver.** If `cookies_result.zip` ≤ `DOC_UPLOAD_LIMIT`, the bot uploads it via `bot.send_document()`. Otherwise the bot stops with a clear `❌ Result zip is too large for Telegram` error and asks the user to re-run with a stricter keyword filter.
 
 ## Tests
 

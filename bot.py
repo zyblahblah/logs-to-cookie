@@ -42,7 +42,7 @@ from telegram.ext import (
     filters,
 )
 
-from pipeline import is_archive_url, run_pipeline
+from pipeline import run_pipeline
 
 load_dotenv()
 
@@ -142,10 +142,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     text = (
         "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
-        "Send me a *direct download URL* to your logs (`.txt`, `.zip`, "
-        "`.7z`, or `.rar`). I'll stream it, extract every Netscape "
-        "cookie I can find, and send each cookie set back as its own "
-        "`.txt` file inside a single zip.\n\n"
+        "Send me a *direct download URL* to your logs. I accept any "
+        "`http(s)` link — zip, 7z, rar, or even tokenised CDN paths "
+        "that don't end in `.zip`/`.7z`/`.rar`. I'll stream it, "
+        "extract every Netscape cookie I can find, and send each "
+        "cookie set back as its own `.txt` file inside a single zip.\n\n"
         "At any time you can send /cancel to abort."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -164,7 +165,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 2a — INPUT. User just sent the download URL."""
+    """Phase 2a — INPUT. User just sent the download URL.
+
+    Tokenised CDN URLs (LinkForge, Telegram-CDN, file-host paths…)
+    rarely carry a ``.zip``/``.7z``/``.rar`` suffix, so we can't tell
+    from the URL alone whether the body is encrypted. Always ask for
+    the password — the user can /skip if the archive isn't protected.
+    """
     text = (update.message.text or "").strip()
     if text.startswith("/"):
         return await cmd_cancel(update, context)
@@ -177,22 +184,12 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ASK_URL
 
     context.user_data["url"] = text
-    if is_archive_url(text):
-        await update.message.reply_text(
-            "🔐 Archive detected. Send the *password* required to "
-            "extract it, or send /skip if it's not encrypted.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return ASK_PASSWORD
-
-    # Plain text URL — no password needed, jump straight to keywords.
-    context.user_data["password"] = None
     await update.message.reply_text(
-        "🔎 Send the *keywords* you want to filter cookies by "
-        "(comma-separated), or send /skip to keep every cookie.",
+        "🔐 Got the link. If the archive is encrypted, send the "
+        "*password* now. Otherwise send /skip.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    return ASK_KEYWORDS
+    return ASK_PASSWORD
 
 
 async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

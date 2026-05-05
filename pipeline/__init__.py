@@ -3,6 +3,7 @@
 from .archive import (
     ARCHIVE_SUFFIXES,
     ArchiveError,
+    detect_archive_kind,
     extract_archive,
     is_archive_url,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "DownloadError",
     "NETSCAPE_HEADER",
     "PipelineResult",
+    "detect_archive_kind",
     "download_to_file",
     "extract_archive",
     "extract_cookies_from_text",
