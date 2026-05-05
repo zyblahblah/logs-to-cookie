@@ -1,14 +1,21 @@
-"""Telegram bot worker for logs-to-cookie.
+"""Telegram bot — Logs to Netscape Cookie Converter.
 
-Implements the streaming pipeline described in the project README:
+Implements the interactive flow shown in
+``telegram_bot_cookie_converter_flow.svg``::
 
-    /process <url> [filter]
+    /start
+       └─► Bot asks for the direct download URL of the logs
+            └─► Bot asks for the archive password (or /skip)
+                 └─► Bot asks for keywords to filter on (or /skip)
+                      └─► Pipeline runs (chunked download → parse →
+                          convert → 1 file per cookie set → zip)
+                           └─► Bot returns the zip directly, or a
+                               hosted download link if the zip is
+                               too large for Telegram's bot upload
+                               limit.
 
-Optionally asks the user for an archive password when the URL points
-at a ``.zip`` / ``.rar`` / ``.7z`` file.
-
-Runs as ``worker: python bot.py`` on Railway. Reads ``BOT_TOKEN`` and
-``ADMIN_IDS`` from env vars (or ``./.env``).
+Run as ``worker: python bot.py``. ``BOT_TOKEN`` and ``ADMIN_IDS`` are
+read from the environment (or a local ``.env`` file).
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional, Sequence
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -35,8 +42,8 @@ from telegram.ext import (
     filters,
 )
 
-from extract import ARCHIVE_SUFFIXES
-from processor import process_url
+from pipeline import is_archive_url, run_pipeline
+from webserver import FileHost, from_env as webserver_from_env
 
 load_dotenv()
 
@@ -48,10 +55,24 @@ log = logging.getLogger("logs-to-cookie.bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
+MAX_DOWNLOAD_BYTES = int(
+    os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
+)
 
 
-def _parse_admins(raw: str) -> Set[int]:
-    out: Set[int] = set()
+# ---------------------------------------------------------------------------
+# Conversation states
+# ---------------------------------------------------------------------------
+ASK_URL = 1
+ASK_PASSWORD = 2
+ASK_KEYWORDS = 3
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _parse_admins(raw: str) -> set[int]:
+    out: set[int] = set()
     for part in (raw or "").replace(";", ",").split(","):
         part = part.strip()
         if not part:
@@ -63,9 +84,7 @@ def _parse_admins(raw: str) -> Set[int]:
     return out
 
 
-ADMIN_IDS: Set[int] = _parse_admins(os.getenv("ADMIN_IDS", ""))
-
-ASK_PASSWORD = 1
+ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", ""))
 
 
 def _is_admin(update: Update) -> bool:
@@ -83,11 +102,6 @@ def _looks_like_url(s: str) -> bool:
     return u.scheme in ("http", "https") and bool(u.netloc)
 
 
-def _looks_like_archive_url(url: str) -> bool:
-    name = Path(urlparse(url).path).name.lower()
-    return any(name.endswith(suf) for suf in ARCHIVE_SUFFIXES)
-
-
 def _human_bytes(n: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     f = float(n)
@@ -98,126 +112,178 @@ def _human_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def _progress_bar(read: int, total: Optional[int], width: int = 12) -> str:
+    if total and total > 0:
+        ratio = min(1.0, read / total)
+        filled = int(ratio * width)
+        bar = "▓" * filled + "░" * (width - filled)
+        pct = f"{ratio * 100:.1f}%"
+        return f"{bar} {pct}  ({_human_bytes(read)} / {_human_bytes(total)})"
+    return f"░░░░░░░░░░░░ — ({_human_bytes(read)} so far)"
+
+
+def _split_keywords(text: str) -> list[str]:
+    parts: list[str] = []
+    for chunk in text.replace(";", ",").split(","):
+        for sub in chunk.split():
+            sub = sub.strip()
+            if sub:
+                parts.append(sub)
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Phase 1 — START. Greet and ask for the download URL."""
     if not _is_admin(update):
-        return
+        return ConversationHandler.END
+
+    context.user_data.clear()
     text = (
-        "👋 *logs-to-cookie* — direct-link streaming bot\n\n"
-        "Usage:\n"
-        "`/process <url> [filter]`\n\n"
-        "Streams the URL chunk-by-chunk, parses every Netscape cookie line "
-        "(optionally filtered by `[filter]`), writes each match as its own "
-        "`cookie_N.txt`, and sends them back zipped.\n\n"
-        "If the URL points at a password-protected archive "
-        "(.zip / .rar / .7z), I'll ask for the password after you run "
-        "`/process`."
+        "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
+        "Send me a *direct download URL* to your logs (`.txt`, `.zip`, "
+        "`.7z`, or `.rar`). I'll stream it, extract every Netscape "
+        "cookie I can find, and send each cookie set back as its own "
+        "`.txt` file inside a single zip.\n\n"
+        "At any time you can send /cancel to abort."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    return ASK_URL
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await cmd_start(update, context)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await cmd_start(update, context)
 
 
-async def cmd_cancel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     if update.message:
         await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
-async def cmd_process(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    if not _is_admin(update):
-        return ConversationHandler.END
-
-    args = context.args or []
-    if not args:
+async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Phase 2a — INPUT. User just sent the download URL."""
+    text = (update.message.text or "").strip()
+    if text.startswith("/"):
+        return await cmd_cancel(update, context)
+    if not _looks_like_url(text):
         await update.message.reply_text(
-            "Usage: `/process <url> [filter]`",
+            "That doesn't look like an `http(s)` URL. "
+            "Send the direct download URL again, or /cancel.",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return ConversationHandler.END
+        return ASK_URL
 
-    url = args[0]
-    keyword = " ".join(args[1:]).strip() or None
-
-    if not _looks_like_url(url):
+    context.user_data["url"] = text
+    if is_archive_url(text):
         await update.message.reply_text(
-            "That doesn't look like an http(s) URL."
-        )
-        return ConversationHandler.END
-
-    context.user_data["url"] = url
-    context.user_data["keyword"] = keyword
-
-    if _looks_like_archive_url(url):
-        await update.message.reply_text(
-            "Archive URL detected. Send the password (or `none`):",
+            "🔐 Archive detected. Send the *password* required to "
+            "extract it, or send /skip if it's not encrypted.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_PASSWORD
 
-    await _run_job(update, context, password=None)
-    return ConversationHandler.END
+    # Plain text URL — no password needed, jump straight to keywords.
+    context.user_data["password"] = None
+    await update.message.reply_text(
+        "🔎 Send the *keywords* you want to filter cookies by "
+        "(comma-separated), or send /skip to keep every cookie.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ASK_KEYWORDS
 
 
-async def on_password(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Phase 2b — INPUT. User just answered the password prompt."""
     text = (update.message.text or "").strip()
     if text.startswith("/"):
-        return await cmd_cancel(update, context)
-    password: Optional[str] = None if text.lower() in ("none", "-", "") else text
-    await _run_job(update, context, password=password)
+        if text.lower().startswith("/skip"):
+            context.user_data["password"] = None
+        elif text.lower().startswith("/cancel"):
+            return await cmd_cancel(update, context)
+        else:
+            return await cmd_cancel(update, context)
+    elif text.lower() in ("none", "-", "skip", ""):
+        context.user_data["password"] = None
+    else:
+        context.user_data["password"] = text
+
+    await update.message.reply_text(
+        "🔎 Send the *keywords* you want to filter cookies by "
+        "(comma-separated), or send /skip to keep every cookie.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ASK_KEYWORDS
+
+
+async def on_keywords(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Phase 2c — INPUT. User just answered the keyword prompt."""
+    text = (update.message.text or "").strip()
+    if text.startswith("/"):
+        if text.lower().startswith("/skip"):
+            keywords: list[str] = []
+        elif text.lower().startswith("/cancel"):
+            return await cmd_cancel(update, context)
+        else:
+            return await cmd_cancel(update, context)
+    elif text.lower() in ("none", "-", "skip", ""):
+        keywords = []
+    else:
+        keywords = _split_keywords(text)
+
+    context.user_data["keywords"] = keywords
+    await _run_job(update, context)
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
-# Job runner
+# Phase 3-5 — PROCESS, OUTPUT, FEEDBACK
 # ---------------------------------------------------------------------------
-
-
 async def _run_job(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    *,
-    password: Optional[str],
 ) -> None:
     url: str = context.user_data.get("url", "")
-    keyword: Optional[str] = context.user_data.get("keyword")
+    password: Optional[str] = context.user_data.get("password")
+    keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
     started = time.time()
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="🌀 Status: Starting...",
+        text="⏳ Downloading...",
     )
 
-    last_edit = 0.0
+    loop = asyncio.get_event_loop()
+    last_text = ""
 
     async def _edit(text: str) -> None:
-        nonlocal last_edit
+        nonlocal last_text
+        if text == last_text:
+            return
+        last_text = text
         try:
             await status_msg.edit_text(text)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-        last_edit = time.time()
 
-    loop = asyncio.get_event_loop()
-
-    def _post_status(s: str) -> None:
-        # called from worker thread → schedule on event loop
+    def _post_status(line: str) -> None:
         elapsed = int(time.time() - started)
-        body = f"🌀 Status: {s}\n⏱️ Elapsed: {elapsed}s"
+        body = f"{line}\n⏱️ Elapsed: {elapsed}s"
+        asyncio.run_coroutine_threadsafe(_edit(body), loop)
+
+    def _post_progress(read: int, total: Optional[int]) -> None:
+        elapsed = int(time.time() - started)
+        body = (
+            "⏳ Downloading...\n"
+            f"{_progress_bar(read, total)}\n"
+            f"⏱️ Elapsed: {elapsed}s"
+        )
         asyncio.run_coroutine_threadsafe(_edit(body), loop)
 
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
@@ -225,21 +291,23 @@ async def _run_job(
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda: process_url(
+                lambda: run_pipeline(
                     url,
                     workdir,
-                    keyword=keyword,
                     password=password,
+                    keywords=keywords,
+                    max_bytes=MAX_DOWNLOAD_BYTES,
                     on_status=_post_status,
+                    on_progress=_post_progress,
                 ),
             )
         except Exception as exc:  # noqa: BLE001
-            log.exception("process_url failed for %s", url)
-            await _edit(f"❌ Failed: {exc}")
+            log.exception("pipeline failed for %s", url)
+            await _edit(f"❌ Error: {exc}")
             return
 
         elapsed = int(time.time() - started)
-        if result.item_count == 0:
+        if result.cookie_count == 0:
             await _edit(
                 "ℹ️ Done — no matching cookies found.\n"
                 f"📡 Read: {_human_bytes(result.bytes_read)}\n"
@@ -248,37 +316,75 @@ async def _run_job(
             return
 
         zip_size = result.zip_path.stat().st_size
-        if zip_size > DOC_UPLOAD_LIMIT:
+
+        # ---------- decision: send file or hosted link ----------
+        host: Optional[FileHost] = context.bot_data.get("file_host")
+
+        if zip_size <= DOC_UPLOAD_LIMIT:
             await _edit(
-                "⚠️ Result zip too large for Telegram upload.\n"
-                f"📦 {result.item_count} cookie file(s)\n"
-                f"📡 zip: {_human_bytes(zip_size)} > limit "
-                f"{_human_bytes(DOC_UPLOAD_LIMIT)}\n"
+                "📤 Uploading result...\n"
+                f"📦 {len(result.cookie_files)} cookie set(s) — "
+                f"{result.cookie_count} cookies\n"
+                f"📡 zip: {_human_bytes(zip_size)}\n"
                 f"⏱️ Elapsed: {elapsed}s"
+            )
+            with open(result.zip_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=result.zip_path.name,
+                    caption=(
+                        f"✅ {len(result.cookie_files)} cookie set(s) — "
+                        f"{result.cookie_count} cookies\n"
+                        f"📡 read: {_human_bytes(result.bytes_read)}\n"
+                        f"⏱️ {elapsed}s"
+                    ),
+                )
+            await _edit(
+                f"✅ Done! Sent {_human_bytes(zip_size)} "
+                f"({len(result.cookie_files)} sets, "
+                f"{result.cookie_count} cookies)."
+            )
+            return
+
+        # zip too large — fall back to a hosted download link.
+        if host is None:
+            await _edit(
+                "⚠️ Result zip too large for Telegram upload, and the "
+                "built-in file host is disabled.\n"
+                f"📦 {len(result.cookie_files)} cookie set(s)\n"
+                f"📡 zip: {_human_bytes(zip_size)} > limit "
+                f"{_human_bytes(DOC_UPLOAD_LIMIT)}"
             )
             return
 
         await _edit(
-            "📤 Uploading result...\n"
-            f"📦 {result.item_count} cookie file(s)\n"
-            f"📡 zip: {_human_bytes(zip_size)}\n"
-            f"⏱️ Elapsed: {elapsed}s"
+            "📤 Result is too large for Telegram. Hosting it for you...\n"
+            f"📦 {_human_bytes(zip_size)} — "
+            f"{len(result.cookie_files)} cookie set(s), "
+            f"{result.cookie_count} cookies"
         )
-
-        with open(result.zip_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=result.zip_path.name,
-                caption=(
-                    f"✅ {result.item_count} cookie file(s)\n"
-                    f"📡 read: {_human_bytes(result.bytes_read)}\n"
-                    f"⏱️ {int(time.time() - started)}s"
-                ),
-            )
+        download_url = host.host_file(
+            result.zip_path,
+            filename="cookies_result.zip",
+        )
+        ttl_min = max(1, host.ttl_seconds // 60)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ *Done!*\n"
+                f"Direct download link (valid ~{ttl_min} min):\n"
+                f"{download_url}\n\n"
+                f"📦 {_human_bytes(zip_size)} — "
+                f"{len(result.cookie_files)} cookie set(s), "
+                f"{result.cookie_count} cookies"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
         await _edit(
-            f"✅ Done — sent {_human_bytes(zip_size)} "
-            f"({result.item_count} cookies)."
+            f"✅ Done! Hosted {_human_bytes(zip_size)} — "
+            f"see the download link above."
         )
     finally:
         context.user_data.clear()
@@ -288,32 +394,68 @@ async def _run_job(
 # ---------------------------------------------------------------------------
 # Wiring
 # ---------------------------------------------------------------------------
+async def _post_init(app: Application) -> None:
+    spool_dir = Path(tempfile.gettempdir()) / "logs2cookie-host"
+    server, base = webserver_from_env(spool_dir)
+    try:
+        await server.start()
+        app.bot_data["file_host"] = server
+        log.info("hosted-result base URL = %s", base)
+    except OSError as exc:
+        log.warning(
+            "failed to start file host (%s) — oversized results will "
+            "not be deliverable until this is fixed.",
+            exc,
+        )
+
+
+async def _post_shutdown(app: Application) -> None:
+    server: Optional[FileHost] = app.bot_data.get("file_host")
+    if server is not None:
+        await server.stop()
 
 
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise SystemExit(
-            "BOT_TOKEN is not set. Add it to .env or your Railway "
-            "environment variables."
+            "BOT_TOKEN is not set. Add it to .env or your hosting "
+            "provider's environment variables."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("process", cmd_process)],
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CommandHandler("help", cmd_help),
+        ],
         states={
-            ASK_PASSWORD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_password),
+            ASK_URL: [
                 CommandHandler("cancel", cmd_cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_url),
+            ],
+            ASK_PASSWORD: [
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("skip", on_password),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_password),
+            ],
+            ASK_KEYWORDS: [
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("skip", on_keywords),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_keywords),
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        name="process_conv",
+        name="logs2cookie_conv",
         persistent=False,
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     return app
@@ -322,8 +464,10 @@ def build_app() -> Application:
 def main() -> None:
     app = build_app()
     log.info(
-        "logs-to-cookie bot starting (admins=%s)",
+        "logs-to-cookie bot starting (admins=%s, doc_limit=%s, max_dl=%s)",
         ADMIN_IDS or "<everyone>",
+        _human_bytes(DOC_UPLOAD_LIMIT),
+        _human_bytes(MAX_DOWNLOAD_BYTES),
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
