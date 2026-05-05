@@ -62,3 +62,66 @@ def test_split_urls_drops_slash_commands(bot_module) -> None:
 def test_split_urls_empty(bot_module) -> None:
     assert bot_module._split_urls("") == []
     assert bot_module._split_urls("   \n\n   ") == []
+
+
+# ---------------------------------------------------------------------------
+# Inline-password parsing (url|password syntax).
+# ---------------------------------------------------------------------------
+def test_parse_url_lines_no_inline(bot_module) -> None:
+    text = "https://a.com/1\nhttps://b.com/2"
+    assert bot_module._parse_url_lines(text) == [
+        ("https://a.com/1", None),
+        ("https://b.com/2", None),
+    ]
+
+
+def test_parse_url_lines_with_inline_passwords(bot_module) -> None:
+    text = (
+        "https://a.com/1|secret-a\n"
+        "https://b.com/2\n"
+        "https://c.com/3|p3-with-spaces are fine"
+    )
+    assert bot_module._parse_url_lines(text) == [
+        ("https://a.com/1", "secret-a"),
+        ("https://b.com/2", None),
+        ("https://c.com/3", "p3-with-spaces are fine"),
+    ]
+
+
+def test_parse_url_lines_empty_inline_password_treated_as_none(bot_module) -> None:
+    # ``url|`` (trailing separator with no password) should yield None.
+    text = "https://a.com/1|\nhttps://b.com/2"
+    assert bot_module._parse_url_lines(text) == [
+        ("https://a.com/1", None),
+        ("https://b.com/2", None),
+    ]
+
+
+def test_parse_url_lines_dedupes_keeps_first_password(bot_module) -> None:
+    text = (
+        "https://a.com/1|first-pwd\n"
+        "https://a.com/1|second-pwd-ignored\n"
+        "https://b.com/2"
+    )
+    assert bot_module._parse_url_lines(text) == [
+        ("https://a.com/1", "first-pwd"),
+        ("https://b.com/2", None),
+    ]
+
+
+def test_split_passwords_single(bot_module) -> None:
+    assert bot_module._split_passwords("hunter2") == ["hunter2"]
+
+
+def test_split_passwords_list(bot_module) -> None:
+    assert bot_module._split_passwords("p1, p2, p3") == ["p1", "p2", "p3"]
+    assert bot_module._split_passwords("p1\np2\np3") == ["p1", "p2", "p3"]
+
+
+def test_split_passwords_blank_entries_become_none(bot_module) -> None:
+    assert bot_module._split_passwords("p1, , p3") == ["p1", None, "p3"]
+    assert bot_module._split_passwords("p1,skip,p3") == ["p1", None, "p3"]
+
+
+def test_split_passwords_empty(bot_module) -> None:
+    assert bot_module._split_passwords("") == []

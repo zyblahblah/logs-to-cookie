@@ -246,6 +246,96 @@ def test_pipeline_multi_partial_failure_keeps_good_results(
     assert result.bytes_read >= len(body_a)
 
 
+def test_pipeline_multi_passwords_length_mismatch_raises(tmp_path: Path) -> None:
+    body = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    with serve(body) as url_a, serve(body) as url_b:
+        with pytest.raises(ValueError, match="passwords has"):
+            run_pipeline_multi(
+                [url_a, url_b],
+                tmp_path,
+                passwords=["only-one"],  # 1 password, 2 URLs
+            )
+
+
+def test_pipeline_multi_passwords_list_overrides_single(tmp_path: Path) -> None:
+    """When both ``password=`` and ``passwords=`` are given, the list wins."""
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    body_b = (f"{GOOD_LINE_B}\n").encode("utf-8")
+
+    # Both URLs are plain text, so the password is unused; we're just
+    # verifying that supplying the list doesn't break anything and that
+    # both URLs are still processed.
+    with serve(body_a) as url_a, serve(body_b) as url_b:
+        result = run_pipeline_multi(
+            [url_a, url_b],
+            tmp_path,
+            password="ignored-because-list-wins",
+            passwords=["per-url-a", None],
+        )
+
+    assert result.cookie_count == 2
+    assert len(result.cookie_files) == 2
+
+
+@pytest.mark.skipif(
+    shutil.which("7z") is None
+    and shutil.which("7za") is None
+    and shutil.which("7zz") is None,
+    reason="7z binary not available on this host",
+)
+def test_pipeline_multi_per_url_passwords_decrypt_correctly(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: two encrypted archives with *different* passwords."""
+    import subprocess
+
+    sevenzip = (
+        shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+    )
+    assert sevenzip is not None  # for type checkers
+
+    archives: list[bytes] = []
+    passwords = ["pwd-alpha", "pwd-beta"]
+    for label, line, pwd in (
+        ("alpha", GOOD_LINE_A, passwords[0]),
+        ("beta", GOOD_LINE_B, passwords[1]),
+    ):
+        src_root = tmp_path / f"src_{label}"
+        (src_root / f"victim_{label}").mkdir(parents=True)
+        (src_root / f"victim_{label}" / "cookies.txt").write_text(
+            f"{line}\n", encoding="utf-8"
+        )
+        archive_path = tmp_path / f"logs_{label}.zip"
+        # ``-mhe=on`` would also encrypt headers but only for 7z; for
+        # zip we just rely on per-file encryption with the password.
+        subprocess.run(
+            [
+                sevenzip,
+                "a",
+                "-tzip",
+                f"-p{pwd}",
+                str(archive_path),
+                str(src_root) + "/.",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        archives.append(archive_path.read_bytes())
+
+    work = tmp_path / "work"
+    with serve_zip(archives[0], url_path="/a.zip") as url_a, serve_zip(
+        archives[1], url_path="/b.zip"
+    ) as url_b:
+        result = run_pipeline_multi(
+            [url_a, url_b],
+            work,
+            passwords=passwords,
+        )
+
+    assert result.cookie_count == 2
+    assert len(result.cookie_files) == 2
+
+
 @pytest.mark.skipif(
     shutil.which("7z") is None
     and shutil.which("7za") is None

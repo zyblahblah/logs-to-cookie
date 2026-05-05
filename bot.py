@@ -170,28 +170,84 @@ def _split_keywords(text: str) -> list[str]:
     return parts
 
 
+URL_PASSWORD_SEPARATOR = "|"
+
+
 def _split_urls(text: str) -> List[str]:
     """Pull every ``http(s)`` URL out of free-form text.
 
-    Users routinely paste a column of links separated by newlines, or
-    a comma-separated list, sometimes mixing both. We split on all of
-    those, dedupe while preserving order, and silently drop anything
-    that doesn't look like an HTTP URL.
+    Thin wrapper around :func:`_parse_url_lines` for callers that
+    don't care about inline passwords.
     """
-    parts: List[str] = []
+    return [u for u, _ in _parse_url_lines(text)]
+
+
+def _parse_url_lines(text: str) -> List[tuple[str, Optional[str]]]:
+    """Pull every ``http(s)`` URL plus optional inline password.
+
+    Users can either paste plain URLs (one per line / comma- or
+    whitespace-separated) **or** mix in inline passwords with the
+    syntax ``url|password``. Lines without an inline password yield
+    ``(url, None)``.
+
+    Dedupes by URL while preserving first-seen order. The first
+    inline password seen for a given URL wins; later duplicates are
+    silently dropped.
+    """
+    out: List[tuple[str, Optional[str]]] = []
     seen: set[str] = set()
-    for chunk in text.replace(";", "\n").replace(",", "\n").split("\n"):
-        for sub in chunk.split():
-            sub = sub.strip()
-            if not sub or sub.startswith("/"):
+    # Newlines + commas + semicolons are line separators; passwords
+    # may contain spaces so we DON'T split on whitespace at the line
+    # level when an inline separator is present.
+    for raw in text.replace(";", "\n").replace(",", "\n").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("/"):
+            continue
+        if URL_PASSWORD_SEPARATOR in line:
+            url_part, _, pwd_tail = line.partition(URL_PASSWORD_SEPARATOR)
+            url_part = url_part.strip()
+            pwd_part: Optional[str] = pwd_tail.strip() or None
+            if not url_part or not _looks_like_url(url_part):
                 continue
-            if not _looks_like_url(sub):
+            if url_part in seen:
                 continue
-            if sub in seen:
-                continue
-            seen.add(sub)
-            parts.append(sub)
-    return parts
+            seen.add(url_part)
+            out.append((url_part, pwd_part))
+        else:
+            # Plain line — may still contain multiple whitespace-
+            # separated URLs, none with inline passwords.
+            for tok in line.split():
+                tok = tok.strip()
+                if not tok or tok.startswith("/"):
+                    continue
+                if not _looks_like_url(tok):
+                    continue
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                out.append((tok, None))
+    return out
+
+
+def _split_passwords(text: str) -> List[Optional[str]]:
+    """Split a free-form password reply into a list.
+
+    Users may type a single password (the common case) or a column /
+    comma-separated list of passwords (one per remaining URL). Empty
+    entries become ``None`` so a list like ``"p1, , p3"`` lets users
+    skip the middle URL.
+    """
+    if not text:
+        return []
+    raw = text.replace(";", "\n").replace(",", "\n")
+    out: List[Optional[str]] = []
+    for chunk in raw.split("\n"):
+        chunk = chunk.strip()
+        if chunk.lower() in ("none", "-", "skip", ""):
+            out.append(None)
+        else:
+            out.append(chunk)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +271,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"(up to {MAX_LINKS_PER_JOB} per job). Paste them on separate "
         "lines, comma-separated, or whitespace-separated — I'll figure "
         "it out. I accept any `http(s)` link — zip, 7z, rar, or "
-        "tokenised CDN paths that don't end in `.zip`/`.7z`/`.rar`. "
-        "I'll stream them, extract every Netscape cookie I can find, "
-        "and send each cookie set back as its own `.txt` file inside "
-        "a single zip.\n\n"
+        "tokenised CDN paths that don't end in `.zip`/`.7z`/`.rar`.\n\n"
+        "🔑 *Per-link passwords*: append "
+        f"`{URL_PASSWORD_SEPARATOR}password` to a URL to give that "
+        "link its own password (e.g. `https://example.com/logs.zip"
+        f"{URL_PASSWORD_SEPARATOR}s3cret`). Mix and match — links "
+        "without an inline password fall back to whatever you supply "
+        "at the next prompt.\n\n"
+        "I'll stream every link, extract every Netscape cookie I can "
+        "find, and send each cookie set back as its own `.txt` file "
+        "inside a single zip.\n\n"
         "At any time you can send /cancel to abort, or /queue to see "
         "where you are in line."
     )
@@ -252,30 +314,63 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if text.startswith("/"):
         return await cmd_cancel(update, context)
 
-    urls = _split_urls(text)
-    if not urls:
+    pairs = _parse_url_lines(text)
+    if not pairs:
         await update.message.reply_text(
             "I couldn't find a valid `http(s)` URL in that. "
             "Send the direct download URL(s) again, or /cancel.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_URL
-    if len(urls) > MAX_LINKS_PER_JOB:
+    if len(pairs) > MAX_LINKS_PER_JOB:
         await update.message.reply_text(
-            f"⚠️ That's {len(urls)} links — the per-job cap is "
+            f"⚠️ That's {len(pairs)} links — the per-job cap is "
             f"{MAX_LINKS_PER_JOB}. Trim the list and try again, or "
             "/cancel.",
         )
         return ASK_URL
 
+    urls = [u for u, _ in pairs]
+    inline_passwords = [p for _, p in pairs]
     context.user_data["urls"] = urls
-    if len(urls) == 1:
+    context.user_data["inline_passwords"] = inline_passwords
+
+    n = len(urls)
+    n_inline = sum(1 for p in inline_passwords if p is not None)
+    n_remaining = n - n_inline
+
+    if n_remaining == 0:
+        # Every URL already has its password from the inline syntax —
+        # skip the password prompt entirely.
+        context.user_data["passwords"] = list(inline_passwords)
+        await update.message.reply_text(
+            f"🔐 Got *{n}* link(s) — every one came with an inline "
+            "password, so skipping the password prompt.\n\n"
+            "🔎 Send the *keywords* you want to filter cookies by "
+            "(comma-separated), or send /skip to keep every cookie.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_KEYWORDS
+
+    if n == 1:
         msg = "🔐 Got the link. "
     else:
-        msg = f"🔐 Got *{len(urls)}* links. "
+        if n_inline:
+            msg = (
+                f"🔐 Got *{n}* links — {n_inline} already have inline "
+                f"passwords, {n_remaining} still need one. "
+            )
+        else:
+            msg = f"🔐 Got *{n}* links. "
     msg += (
-        "If your archives are encrypted, send the *password* now "
-        "(used for every link). Otherwise send /skip."
+        "If your archives are encrypted, send the *password*. "
+        f"For multi-link jobs you can send a *single* password "
+        f"(used for all {n_remaining} link(s) without an inline "
+        f"password) or *{n_remaining}* passwords (comma- or "
+        "newline-separated, in order). Send /skip if none are "
+        "encrypted.\n\n"
+        "💡 Tip: paste passwords inline at the URL prompt with "
+        f"`url{URL_PASSWORD_SEPARATOR}password` per line."
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     return ASK_PASSWORD
@@ -284,17 +379,48 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Phase 2b — INPUT. User just answered the password prompt."""
     text = (update.message.text or "").strip()
+
+    inline_passwords: List[Optional[str]] = (
+        context.user_data.get("inline_passwords") or []
+    )
+    remaining_idx = [i for i, p in enumerate(inline_passwords) if p is None]
+    n_remaining = len(remaining_idx)
+
     if text.startswith("/"):
         if text.lower().startswith("/skip"):
-            context.user_data["password"] = None
+            replies: List[Optional[str]] = [None] * n_remaining
         elif text.lower().startswith("/cancel"):
             return await cmd_cancel(update, context)
         else:
             return await cmd_cancel(update, context)
     elif text.lower() in ("none", "-", "skip", ""):
-        context.user_data["password"] = None
+        replies = [None] * n_remaining
     else:
-        context.user_data["password"] = text
+        parsed = _split_passwords(text)
+        # Drop trailing empty entries so a stray newline doesn't trip
+        # the count check.
+        while parsed and parsed[-1] is None:
+            parsed.pop()
+        if len(parsed) == 1:
+            # Single password — fan it out to every remaining URL.
+            replies = [parsed[0]] * n_remaining
+        elif len(parsed) == n_remaining:
+            replies = parsed
+        else:
+            await update.message.reply_text(
+                f"⚠️ You sent {len(parsed)} password(s) but I need "
+                f"either *1* (used for all) or *{n_remaining}* "
+                "(one per remaining link, in order). Try again, or "
+                "send /skip / /cancel.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ASK_PASSWORD
+
+    # Merge: keep inline passwords as-is; fill the holes with replies.
+    merged: List[Optional[str]] = list(inline_passwords)
+    for slot, value in zip(remaining_idx, replies):
+        merged[slot] = value
+    context.user_data["passwords"] = merged
 
     await update.message.reply_text(
         "🔎 Send the *keywords* you want to filter cookies by "
@@ -334,7 +460,10 @@ async def _submit_job(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     urls: List[str] = context.user_data.get("urls") or []
-    password: Optional[str] = context.user_data.get("password")
+    passwords: List[Optional[str]] = (
+        context.user_data.get("passwords")
+        or [None] * len(urls)
+    )
     keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -358,7 +487,7 @@ async def _submit_job(
             chat_id=chat_id,
             status_msg_id=status_msg.message_id,
             urls=urls,
-            password=password,
+            passwords=passwords,
             keywords=keywords,
         )
 
@@ -422,7 +551,7 @@ async def _run_pipeline_for_job(
     chat_id: int,
     status_msg_id: int,
     urls: Sequence[str],
-    password: Optional[str],
+    passwords: Sequence[Optional[str]],
     keywords: Sequence[str],
 ) -> None:
     started = time.time()
@@ -465,7 +594,7 @@ async def _run_pipeline_for_job(
                 lambda: run_pipeline_multi(
                     list(urls),
                     workdir,
-                    password=password,
+                    passwords=list(passwords),
                     keywords=keywords,
                     max_bytes=MAX_DOWNLOAD_BYTES,
                     on_status=_post_status,

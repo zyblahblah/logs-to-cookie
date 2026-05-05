@@ -258,6 +258,7 @@ def run_pipeline_multi(
     workdir: Path,
     *,
     password: Optional[str] = None,
+    passwords: Optional[Sequence[Optional[str]]] = None,
     keywords: Optional[Sequence[str]] = None,
     max_bytes: Optional[int] = None,
     on_status: Optional[StatusCallback] = None,
@@ -270,9 +271,27 @@ def run_pipeline_multi(
     All cookie sets — across every URL — land in a single
     ``cookies_result.zip``. Each output file's name is prefixed with a
     sequential index plus a ``urlNN`` tag so the source is obvious.
+
+    Passwords:
+      * ``password=...`` — single password applied to every URL
+        (backwards-compatible default).
+      * ``passwords=[...]`` — per-URL passwords. The list **must** be
+        the same length as ``urls``; entries may be ``None`` for
+        URLs that aren't password-protected. ``passwords`` takes
+        precedence over ``password`` when both are given.
     """
     if not urls:
         raise ValueError("run_pipeline_multi requires at least one URL")
+
+    if passwords is not None:
+        passwords_list: List[Optional[str]] = list(passwords)
+        if len(passwords_list) != len(urls):
+            raise ValueError(
+                f"passwords has {len(passwords_list)} entries but "
+                f"got {len(urls)} URL(s); they must match 1:1"
+            )
+    else:
+        passwords_list = [password] * len(urls)
 
     workdir.mkdir(parents=True, exist_ok=True)
     output_dir = workdir / "output"
@@ -329,7 +348,7 @@ def run_pipeline_multi(
                 i,
                 u,
                 workdir=workdir,
-                password=password,
+                password=passwords_list[i],
                 keywords=keywords,
                 max_bytes=max_bytes,
                 on_progress=_make_per_url_progress(i),

@@ -27,8 +27,8 @@ FEEDBACK   📋 Queued #N  ⏳ Downloading... ▓▓░░  ⚙ Processing...  �
 
 | Phase | What happens |
 |---|---|
-| **START** | User sends `/start`. The bot greets them and asks for one or more *direct download URLs* to the logs (paste them on separate lines, comma-separated, or whitespace-separated — up to `MAX_LINKS_PER_JOB`, default 10). |
-| **INPUT** | The bot collects three things in sequence: the URL list, an archive password (used for every link, skippable), and an optional keyword filter (skippable). |
+| **START** | User sends `/start`. The bot greets them and asks for one or more *direct download URLs* to the logs (paste them on separate lines, comma-separated, or whitespace-separated — up to `MAX_LINKS_PER_JOB`, default 10). Per-link passwords can be appended inline with `url\|password`. |
+| **INPUT** | The bot collects three things in sequence: the URL list, password(s) (`/skip`, a single password applied to every link without an inline password, or one password per remaining link in order), and an optional keyword filter (skippable). |
 | **QUEUE** | The job lands in a FIFO queue. With `MAX_CONCURRENT_JOBS=1` (default), users behind the head see a `📋 Queued — position #N` message that updates as jobs ahead of them finish. They can `/queue` any time to inspect the queue or `/cancel` to drop out. |
 | **PROCESS** | The bot streams every URL in 1 MB chunks to a temp file, then sniffs the first few bytes of each to detect zip/7z/rar (so tokenised CDN URLs without `.zip`/`.7z`/`.rar` in the path also work). All URLs are downloaded + extracted in parallel (default 4 workers). Archives are unpacked with the supplied password; every cookie file inside is parsed. Each detected *cookie set* (one per source file) is emitted as its own Netscape `.txt` file. |
 | **OUTPUT** | Every output `.txt` is bundled into a single merged `cookies_result.zip` and uploaded as a Telegram document. If the zip exceeds Telegram's 50 MB bot upload limit, the bot stops with a clear error and asks the user to re-run with a stricter keyword filter. |
@@ -45,6 +45,22 @@ You can send `/cancel` at any prompt to abort the current job.
 | `/skip` | Skip the current prompt (password or keywords). |
 | `/cancel` | Abort the current job (queued **or** in-flight) and reset the conversation. |
 | `/queue` | Show the current queue (running + pending) and your position in it. |
+
+#### Per-link passwords
+
+When you have multiple log archives with **different** passwords, you have two options at the URL prompt:
+
+1. **Inline** — append `|password` to each URL (the password may contain spaces, just no pipe characters):
+
+   ```
+   https://link1.example/logs.zip|password-for-link-1
+   https://link2.example/logs.zip|p4ss with spaces is fine
+   https://link3.example/logs.zip
+   ```
+
+   Links without an inline password will fall through to the regular password prompt.
+
+2. **At the password prompt** — paste a list of passwords (newline- or comma-separated, in the same order as the URLs that don't have inline passwords). A single password still works as a fan-out for every remaining link.
 
 ### Access management
 | Command | Who | What it does |
