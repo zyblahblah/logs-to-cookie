@@ -53,11 +53,13 @@ cp .env.example .env  # then edit .env with your real BOT_TOKEN
 python bot.py
 ```
 
-You'll need `7z` (from `p7zip`) and `unrar` on your `$PATH` for
-encrypted archive extraction. On Debian/Ubuntu:
+You'll need `7z` (from `p7zip-full`) on your `$PATH` for archive
+extraction. Recent p7zip handles `.zip`, `.7z`, and `.rar` (RAR4 and
+RAR5, including encrypted) so you don't need a separate `unrar`.
+On Debian/Ubuntu:
 
 ```bash
-sudo apt-get install -y p7zip-full unrar
+sudo apt-get install -y p7zip-full
 ```
 
 ## Deploy to Railway
@@ -66,7 +68,7 @@ sudo apt-get install -y p7zip-full unrar
 2. Open *Variables* and set:
    - `BOT_TOKEN` — token from [@BotFather](https://t.me/BotFather)
    - `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended).
-3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `railpack.json` installs `p7zip-full` + `unrar` (via apt in the deploy image) so encrypted archives work out of the box; `nixpacks.toml` is also kept around for older Railway services / self-hosters that build with Nixpacks.
+3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `railpack.json` installs `p7zip-full` (via apt in the deploy image) so encrypted archives — zip, 7z, and rar — work out of the box; `nixpacks.toml` is kept around for older Railway services / self-hosters that build with Nixpacks.
 
 > **Heads up — Railway uses Railpack, not Nixpacks, by default since
 > mid-2025.** That's why an earlier version of this README (which only
@@ -75,7 +77,10 @@ sudo apt-get install -y p7zip-full unrar
 > Railpack ignores `nixpacks.toml` entirely; it reads `railpack.json`.
 > If you've forked an older copy, copy
 > [`railpack.json`](./railpack.json) into the root of your repo and
-> redeploy.
+> redeploy. Note that the Railpack runtime image doesn't ship with
+> `multiverse` enabled, so the proprietary `unrar` apt package isn't
+> available; we route `.rar` through `p7zip-full` instead, which
+> handles RAR4 and RAR5 natively.
 
 > **Rotate your token.** Anyone who has seen your bot token can
 > control the bot. If you've ever pasted it in chat, run
@@ -96,7 +101,7 @@ See [`.env.example`](.env.example) for the full list:
 
 1. **Streaming.** `requests.get(stream=True)` pulls 64 KB at a time straight into a temp file on disk — the body is never buffered in RAM and the file is what we sniff for the archive type.
 2. **Line buffer.** Chunks are decoded as UTF-8 (errors replaced) and split on `\n`. Trailing partial lines are stitched onto the next chunk so cookie rows split across chunk boundaries are never lost.
-3. **Detection + extraction.** The first 8 bytes of the saved file are matched against ZIP (`PK\x03\x04` / `PK\x05\x06` / `PK\x07\x08`), 7Z (`7z\xbc\xaf\x27\x1c`) and RAR (`Rar!\x1a\x07`) signatures, so URLs like `https://cdn2.linkforge.xyz/download/AgAD0w22104` (no extension) work just fine. `.zip`/`.7z` archives are then unpacked with `7z x` (handles encryption); `.rar` archives with `unrar x` (handles encryption). The bot fails fast on a wrong password.
+3. **Detection + extraction.** The first 8 bytes of the saved file are matched against ZIP (`PK\x03\x04` / `PK\x05\x06` / `PK\x07\x08`), 7Z (`7z\xbc\xaf\x27\x1c`) and RAR (`Rar!\x1a\x07`) signatures, so URLs like `https://cdn2.linkforge.xyz/download/AgAD0w22104` (no extension) work just fine. All three archive types are then unpacked with `7z x` — recent p7zip handles RAR4 and RAR5 natively, including encryption. The bot also tries `unrar x` as a last-resort fallback if 7z is unavailable. Either way it fails fast on a wrong password.
 4. **Parse.** Every line that matches the 7-column Netscape cookie format (`domain TAB flag TAB path TAB secure TAB expires TAB name TAB value`) is kept. Comments and malformed lines are silently dropped. The `#HttpOnly_` prefix is preserved on the domain column.
 5. **Filter.** If keywords were provided, a row is only kept when its raw line contains at least one of them (case-insensitive).
 6. **Per-set output.** For archive inputs, every detected cookie file in the archive becomes its own `NNNN_<source-path>.txt` Netscape file. For plain-text URLs, the entire stream is one cookie set → one output file.

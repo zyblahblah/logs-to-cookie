@@ -43,7 +43,7 @@ from telegram.ext import (
 )
 
 from pipeline import run_pipeline
-from pipeline.archive import SEVENZIP_BINARIES, UNRAR_BINARIES
+from pipeline.archive import SEVENZIP_BINARIES
 
 load_dotenv()
 
@@ -399,7 +399,7 @@ def build_app() -> Application:
 
 
 def _check_extractor_binaries() -> None:
-    """Warn loudly at startup if the archive extractors aren't on PATH.
+    """Warn loudly at startup if the archive extractor isn't on PATH.
 
     The previous failure mode was: bot deploys cleanly, accepts the
     URL, downloads multi-GB of data, and only then fails with
@@ -414,27 +414,16 @@ def _check_extractor_binaries() -> None:
         return None
 
     sevenzip = _first_on_path(SEVENZIP_BINARIES)
-    unrar = _first_on_path(UNRAR_BINARIES)
     if sevenzip is None:
         log.warning(
             "7z binary not found on PATH (looked for %s). "
-            "ZIP / 7Z extraction will fail at runtime. "
-            "Install p7zip-full on your host (Railway: see "
+            "All archive extraction (zip / 7z / rar) will fail at "
+            "runtime. Install p7zip-full on your host (Railway: see "
             "railpack.json; Debian/Ubuntu: apt-get install p7zip-full).",
             ", ".join(SEVENZIP_BINARIES),
         )
     else:
-        log.info("7z binary OK: %s", sevenzip)
-    if unrar is None:
-        log.warning(
-            "unrar binary not found on PATH (looked for %s). "
-            "RAR extraction will fail at runtime. "
-            "Install unrar on your host (Railway: see railpack.json; "
-            "Debian/Ubuntu: apt-get install unrar).",
-            ", ".join(UNRAR_BINARIES),
-        )
-    else:
-        log.info("unrar binary OK: %s", unrar)
+        log.info("7z binary OK: %s (handles zip, 7z, rar)", sevenzip)
 
 
 def main() -> None:
