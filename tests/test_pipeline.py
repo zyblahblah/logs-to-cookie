@@ -17,7 +17,7 @@ from typing import Iterator
 
 import pytest
 
-from pipeline import run_pipeline
+from pipeline import run_pipeline, run_pipeline_multi
 
 
 GOOD_LINE_A = (
@@ -196,3 +196,89 @@ def test_pipeline_archive_url_without_extension(tmp_path: Path) -> None:
     with zipfile.ZipFile(result.zip_path) as z:
         names = sorted(z.namelist())
     assert all(n.endswith(".txt") for n in names if not n.endswith("/"))
+
+
+def test_pipeline_multi_merges_two_plain_text_urls(tmp_path: Path) -> None:
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    body_b = (f"{GOOD_LINE_B}\n").encode("utf-8")
+
+    with serve(body_a) as url_a, serve(body_b) as url_b:
+        result = run_pipeline_multi([url_a, url_b], tmp_path)
+
+    assert result.cookie_count == 2
+    assert len(result.cookie_files) == 2
+    assert result.zip_path.exists()
+    with zipfile.ZipFile(result.zip_path) as z:
+        names = sorted(z.namelist())
+    # File names embed the source URL index so users can tell which
+    # cookie set came from which link.
+    assert any("url01" in n for n in names)
+    assert any("url02" in n for n in names)
+
+
+def test_pipeline_multi_keyword_filter_applies_to_all(tmp_path: Path) -> None:
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")  # netflix
+    body_b = (f"{GOOD_LINE_B}\n").encode("utf-8")  # example.com
+
+    with serve(body_a) as url_a, serve(body_b) as url_b:
+        result = run_pipeline_multi(
+            [url_a, url_b], tmp_path, keywords=["netflix"]
+        )
+    assert result.cookie_count == 1
+    assert len(result.cookie_files) == 1
+    body = result.cookie_files[0].read_text(encoding="utf-8")
+    assert "netflix" in body.lower()
+    assert "example.com" not in body
+
+
+def test_pipeline_multi_partial_failure_keeps_good_results(
+    tmp_path: Path,
+) -> None:
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    with serve(body_a) as url_a:
+        # url_b is intentionally a port that nothing's listening on, so
+        # the second download will fail. The first should still succeed.
+        bad_url = "http://127.0.0.1:1/never-listens"
+        result = run_pipeline_multi([url_a, bad_url], tmp_path)
+
+    assert result.cookie_count == 1
+    assert len(result.cookie_files) == 1
+    assert result.bytes_read >= len(body_a)
+
+
+@pytest.mark.skipif(
+    shutil.which("7z") is None
+    and shutil.which("7za") is None
+    and shutil.which("7zz") is None,
+    reason="7z binary not available on this host",
+)
+def test_pipeline_multi_archives_merge_into_one_zip(tmp_path: Path) -> None:
+    """Two zip URLs → all victims show up in the merged result zip."""
+    archives: list[bytes] = []
+    for label, line in (("alpha", GOOD_LINE_A), ("beta", GOOD_LINE_B)):
+        src_root = tmp_path / f"src_{label}"
+        (src_root / f"victim_{label}").mkdir(parents=True)
+        (src_root / f"victim_{label}" / "cookies.txt").write_text(
+            f"{line}\n", encoding="utf-8"
+        )
+        archive_path = tmp_path / f"logs_{label}.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            for p in src_root.rglob("*"):
+                if p.is_file():
+                    z.write(p, arcname=p.relative_to(src_root).as_posix())
+        archives.append(archive_path.read_bytes())
+
+    work = tmp_path / "work"
+    with serve_zip(archives[0], url_path="/a.zip") as url_a, serve_zip(
+        archives[1], url_path="/b.zip"
+    ) as url_b:
+        result = run_pipeline_multi([url_a, url_b], work)
+
+    assert len(result.cookie_files) == 2
+    assert result.cookie_count == 2
+    with zipfile.ZipFile(result.zip_path) as z:
+        names = sorted(z.namelist())
+    assert any("alpha" in n for n in names)
+    assert any("beta" in n for n in names)
+    # And the URL-index tag is present on every output filename.
+    assert all("url0" in n for n in names if n.endswith(".txt"))

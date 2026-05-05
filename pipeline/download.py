@@ -17,7 +17,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 64 * 1024  # 64 KB
+CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB — bigger chunks → fewer syscalls → faster
 DEFAULT_TIMEOUT = (30, 600)  # (connect, read)
 DEFAULT_USER_AGENT = "logs-to-cookie/2.0 (+https://github.com/zyblahblah/logs-to-cookie)"
 

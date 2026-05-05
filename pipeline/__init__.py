@@ -15,13 +15,20 @@ from .cookies import (
     write_netscape_file,
 )
 from .download import DownloadError, download_to_file, stream_lines
-from .pipeline import PipelineResult, run_pipeline
+from .jobqueue import Job, JobQueue, JobState
+from .pipeline import PipelineResult, run_pipeline, run_pipeline_multi
+from .storage import AccessStore, KeyInfo
 
 __all__ = [
     "ARCHIVE_SUFFIXES",
+    "AccessStore",
     "ArchiveError",
     "CookieRow",
     "DownloadError",
+    "Job",
+    "JobQueue",
+    "JobState",
+    "KeyInfo",
     "NETSCAPE_HEADER",
     "PipelineResult",
     "detect_archive_kind",
@@ -31,6 +38,7 @@ __all__ = [
     "is_archive_url",
     "parse_cookie_line",
     "run_pipeline",
+    "run_pipeline_multi",
     "stream_lines",
     "write_netscape_file",
 ]
