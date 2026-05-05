@@ -21,6 +21,7 @@ read from the environment (or a local ``.env`` file).
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import shutil
@@ -130,6 +131,32 @@ def _split_keywords(text: str) -> list[str]:
             if sub:
                 parts.append(sub)
     return parts
+
+
+def _format_hosted_link_message(
+    *,
+    download_url: str,
+    ttl_min: int,
+    zip_size: int,
+    cookie_set_count: int,
+    cookie_count: int,
+) -> str:
+    """Build the *hosted download link* message body.
+
+    HTML parse mode is used (instead of Markdown) because the download
+    URL embeds a token + ``cookies_result.zip`` whose underscores would
+    otherwise be interpreted as italic markers and rejected by Telegram
+    with ``BadRequest: Can't parse entities``.
+    """
+    safe_url = html.escape(download_url, quote=False)
+    return (
+        f"✅ <b>Done!</b>\n"
+        f"Direct download link (valid ~{ttl_min} min):\n"
+        f"{safe_url}\n\n"
+        f"📦 {_human_bytes(zip_size)} — "
+        f"{cookie_set_count} cookie set(s), "
+        f"{cookie_count} cookies"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,15 +398,14 @@ async def _run_job(
         ttl_min = max(1, host.ttl_seconds // 60)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=(
-                f"✅ *Done!*\n"
-                f"Direct download link (valid ~{ttl_min} min):\n"
-                f"{download_url}\n\n"
-                f"📦 {_human_bytes(zip_size)} — "
-                f"{len(result.cookie_files)} cookie set(s), "
-                f"{result.cookie_count} cookies"
+            text=_format_hosted_link_message(
+                download_url=download_url,
+                ttl_min=ttl_min,
+                zip_size=zip_size,
+                cookie_set_count=len(result.cookie_files),
+                cookie_count=result.cookie_count,
             ),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         await _edit(
