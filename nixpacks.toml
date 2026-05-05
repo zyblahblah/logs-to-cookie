@@ -1,4 +1,4 @@
-# Railway build configuration.
+# Railway / Nixpacks build configuration.
 # p7zip handles encrypted .zip and .7z archives.
 # unrar handles encrypted .rar archives.
 [phases.setup]

@@ -2,8 +2,17 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
 venv/
+env/
 .env
-*.zip
+
+# Bot runtime artifacts
 output/
+results/
+work/
+*.zip
+*.rar
+*.7z
