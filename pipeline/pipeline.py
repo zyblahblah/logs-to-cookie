@@ -22,8 +22,8 @@ from typing import Callable, List, Optional, Sequence
 
 from .archive import (
     ARCHIVE_SUFFIXES,
+    detect_archive_kind,
     extract_archive,
-    is_archive_url,
 )
 from .cookies import (
     CookieRow,
@@ -31,7 +31,7 @@ from .cookies import (
     parse_cookie_line,
     write_netscape_file,
 )
-from .download import download_to_file, stream_lines
+from .download import download_to_file
 
 log = logging.getLogger(__name__)
 
@@ -166,29 +166,38 @@ def run_pipeline(
     )
 
     # ------------------------------------------------------------------
-    # 1. Download (chunked)
+    # 1. Download (chunked, to disk)
     # ------------------------------------------------------------------
+    # We always download to a file rather than streaming, because users
+    # routinely send tokenised CDN URLs whose path doesn't carry a
+    # ``.zip``/``.7z``/``.rar`` suffix — we can only tell whether the
+    # body is an archive after inspecting its first few bytes on disk.
     status("⏳ Downloading...")
-    if is_archive_url(url):
-        suffix = next(
-            (s for s in ARCHIVE_SUFFIXES if url.lower().endswith(s)),
-            ".zip",
-        )
-        archive_path = workdir / f"input{suffix}"
-        bytes_read = download_to_file(
-            url,
-            archive_path,
-            max_bytes=max_bytes,
-            on_progress=on_progress,
-        )
-        result.bytes_read = bytes_read
+    suffix = next(
+        (s for s in ARCHIVE_SUFFIXES if url.lower().endswith(s)),
+        "",
+    )
+    download_path = workdir / f"input{suffix or '.bin'}"
+    bytes_read = download_to_file(
+        url,
+        download_path,
+        max_bytes=max_bytes,
+        on_progress=on_progress,
+    )
+    result.bytes_read = bytes_read
 
+    # ------------------------------------------------------------------
+    # 2. Decide what we actually got: archive vs plain Netscape file.
+    # ------------------------------------------------------------------
+    kind = detect_archive_kind(download_path)
+
+    if kind is not None:
         # ------------------------------------------------------
-        # 2. Extract
+        # 2a. Extract archive
         # ------------------------------------------------------
-        status("⚙ Processing... (extracting archive)")
+        status(f"⚙ Processing... (extracting {kind} archive)")
         extracted = workdir / "extracted"
-        extract_archive(archive_path, extracted, password=password)
+        extract_archive(download_path, extracted, password=password)
 
         # ------------------------------------------------------
         # 3. Find cookie sources
@@ -216,27 +225,18 @@ def run_pipeline(
                 except OSError:  # pragma: no cover
                     pass
     else:
-        # Plain Netscape cookie URL (or any text URL). We still stream
-        # in 64 KB chunks and write a single Netscape file out.
-        status("⚙ Processing... (streaming cookies)")
+        # Defensive fallback: not an archive by magic bytes. Treat the
+        # downloaded body as a plain Netscape cookie file.
+        status("⚙ Processing... (parsing as plain cookie file)")
         rows: List[CookieRow] = []
-        bytes_read = 0
-
-        def progress(read: int, total: Optional[int]) -> None:
-            nonlocal bytes_read
-            bytes_read = read
-            if on_progress is not None:
-                on_progress(read, total)
-
-        for row in iter_cookies_from_lines(
-            stream_lines(url, max_bytes=max_bytes, on_progress=progress),
-            keywords=keywords,
-        ):
-            rows.append(row)
-        result.bytes_read = bytes_read
+        with open(download_path, "r", encoding="utf-8", errors="replace") as f:
+            for row in iter_cookies_from_lines(f, keywords=keywords):
+                rows.append(row)
 
         if rows:
-            status(f"🔄 Converting... (1 cookie set, {len(rows)} cookies)")
+            status(
+                f"🔄 Converting... (1 cookie set, {len(rows)} cookies)"
+            )
             out_path = cookies_dir / "0001_cookies.txt"
             write_netscape_file(out_path, rows)
             result.cookie_files.append(out_path)

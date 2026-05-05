@@ -65,7 +65,9 @@ def serve(payload: bytes, content_type: str = "text/plain") -> Iterator[str]:
 
 
 @contextmanager
-def serve_zip(zip_bytes: bytes) -> Iterator[str]:
+def serve_zip(
+    zip_bytes: bytes, *, url_path: str = "/payload.zip"
+) -> Iterator[str]:
     port = _free_port()
 
     class Handler(BaseHTTPRequestHandler):
@@ -83,7 +85,7 @@ def serve_zip(zip_bytes: bytes) -> Iterator[str]:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{port}/payload.zip"
+        yield f"http://127.0.0.1:{port}{url_path}"
     finally:
         httpd.shutdown()
         thread.join(timeout=2)
@@ -158,6 +160,39 @@ def test_pipeline_archive_one_file_per_set(tmp_path: Path) -> None:
 
     assert len(result.cookie_files) == 2
     assert result.cookie_count == 2
+
+
+@pytest.mark.skipif(
+    shutil.which("7z") is None
+    and shutil.which("7za") is None
+    and shutil.which("7zz") is None,
+    reason="7z binary not available on this host",
+)
+def test_pipeline_archive_url_without_extension(tmp_path: Path) -> None:
+    """Regression: tokenised CDN URLs (LinkForge-style) carry no
+    ``.zip``/``.7z``/``.rar`` suffix in their path. The pipeline must
+    still detect the archive kind from the response body's magic bytes
+    and extract it correctly.
+    """
+    src_root = tmp_path / "src"
+    (src_root / "victim_alpha").mkdir(parents=True)
+    (src_root / "victim_alpha" / "cookies.txt").write_text(
+        f"{GOOD_LINE_A}\n", encoding="utf-8"
+    )
+    archive_path = tmp_path / "logs.zip"
+    with zipfile.ZipFile(archive_path, "w") as z:
+        for p in src_root.rglob("*"):
+            if p.is_file():
+                z.write(p, arcname=p.relative_to(src_root).as_posix())
+    zip_bytes = archive_path.read_bytes()
+
+    work = tmp_path / "work"
+    # Simulate a CDN URL: tokenised path, no archive extension.
+    with serve_zip(zip_bytes, url_path="/download/AgAD0w22104") as url:
+        result = run_pipeline(url, work)
+
+    assert len(result.cookie_files) == 1
+    assert result.cookie_count == 1
     with zipfile.ZipFile(result.zip_path) as z:
         names = sorted(z.namelist())
     assert all(n.endswith(".txt") for n in names if not n.endswith("/"))
