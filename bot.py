@@ -31,7 +31,9 @@ Concurrency
 Each accepted job is funnelled through a global :class:`JobQueue`.
 ``MAX_CONCURRENT_JOBS`` (default ``1``) caps the number of pipelines
 running at once; users behind the head of the queue see their position
-update with ``/queue``.
+update with ``/queue``. The conversation handler returns the moment a
+job is *queued* (rather than blocking until it's done), so a user can
+fire off another job back-to-back without losing access to ``/start``.
 """
 
 from __future__ import annotations
@@ -43,12 +45,13 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -59,7 +62,7 @@ from telegram.ext import (
 )
 
 from pipeline import AccessStore, Job, JobQueue, run_pipeline_multi
-from pipeline.archive import SEVENZIP_BINARIES
+from pipeline.archive import SEVENZIP_BINARIES, UNRAR_BINARIES
 
 load_dotenv()
 
@@ -71,12 +74,21 @@ log = logging.getLogger("logs-to-cookie.bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
+# Bumped from 5 GB → 50 GB. Most stealer logs sit comfortably under
+# 5 GB but the occasional bundled dump (the one that produced the
+# "22 GB > max 5 GB" rejection in the wild) easily crosses it.
+# Operators can still override with the env var.
 MAX_DOWNLOAD_BYTES = int(
-    os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
+    os.getenv("MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024 * 1024))
 )
 MAX_LINKS_PER_JOB = int(os.getenv("MAX_LINKS_PER_JOB", "10"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json")).expanduser()
+
+# Status edits go through Telegram's ``editMessageText`` API which is
+# rate-limited at roughly 1 edit / second per chat. We coalesce our
+# in-flight edits to avoid hitting ``RetryAfter`` and falling behind.
+EDIT_MIN_INTERVAL = float(os.getenv("EDIT_MIN_INTERVAL", "1.2"))
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +152,7 @@ def _looks_like_url(s: str) -> bool:
     return u.scheme in ("http", "https") and bool(u.netloc)
 
 
-def _human_bytes(n: int) -> str:
+def _human_bytes(n: float) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     f = float(n)
     for u in units:
@@ -150,14 +162,32 @@ def _human_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def _progress_bar(read: int, total: Optional[int], width: int = 12) -> str:
+def _human_speed(bps: Optional[float]) -> str:
+    if not bps or bps <= 0:
+        return "—"
+    return f"{_human_bytes(bps)}/s"
+
+
+def _human_eta(read: int, total: Optional[int], speed: Optional[float]) -> str:
+    if not total or not speed or speed <= 0:
+        return "—"
+    remaining = max(0, total - read)
+    secs = int(remaining / speed)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m {secs % 60:02d}s"
+    return f"{secs // 3600}h {(secs % 3600) // 60:02d}m"
+
+
+def _progress_bar(read: int, total: Optional[int], width: int = 14) -> str:
     if total and total > 0:
         ratio = min(1.0, read / total)
         filled = int(ratio * width)
         bar = "▓" * filled + "░" * (width - filled)
         pct = f"{ratio * 100:.1f}%"
-        return f"{bar} {pct}  ({_human_bytes(read)} / {_human_bytes(total)})"
-    return f"░░░░░░░░░░░░ — ({_human_bytes(read)} so far)"
+        return f"{bar} {pct}\n📡 {_human_bytes(read)} / {_human_bytes(total)}"
+    return f"{'░' * width}\n📡 {_human_bytes(read)} so far"
 
 
 def _split_keywords(text: str) -> list[str]:
@@ -182,7 +212,7 @@ def _split_urls(text: str) -> List[str]:
     return [u for u, _ in _parse_url_lines(text)]
 
 
-def _parse_url_lines(text: str) -> List[tuple[str, Optional[str]]]:
+def _parse_url_lines(text: str) -> List[Tuple[str, Optional[str]]]:
     """Pull every ``http(s)`` URL plus optional inline password.
 
     Users can either paste plain URLs (one per line / comma- or
@@ -194,7 +224,7 @@ def _parse_url_lines(text: str) -> List[tuple[str, Optional[str]]]:
     inline password seen for a given URL wins; later duplicates are
     silently dropped.
     """
-    out: List[tuple[str, Optional[str]]] = []
+    out: List[Tuple[str, Optional[str]]] = []
     seen: set[str] = set()
     # Newlines + commas + semicolons are line separators; passwords
     # may contain spaces so we DON'T split on whitespace at the line
@@ -248,6 +278,46 @@ def _split_passwords(text: str) -> List[Optional[str]]:
         else:
             out.append(chunk)
     return out
+
+
+def _friendly_pipeline_error(exc: Exception) -> str:
+    """Translate a pipeline RuntimeError into something a user can act on."""
+    msg = str(exc)
+    low = msg.lower()
+    # The "file is X bytes, larger than max (Y)" error from
+    # download.DownloadError. Convert raw byte counts to GB so the
+    # user can see at a glance what's happening.
+    if "larger than max" in low:
+        try:
+            # Best-effort: pull the two ints out of the message.
+            import re
+
+            m = re.search(r"file is (\d+) bytes, larger than max \((\d+)\)", msg)
+            if m:
+                actual = int(m.group(1))
+                cap = int(m.group(2))
+                return (
+                    f"❌ File is too big: {_human_bytes(actual)} "
+                    f"(cap: {_human_bytes(cap)}).\n"
+                    "💡 If you trust the source, raise "
+                    "`MAX_DOWNLOAD_BYTES` in your `.env` "
+                    "and restart the bot."
+                )
+        except Exception:  # noqa: BLE001
+            pass
+    if "unsupported method" in low or "unsupported compression" in low:
+        return (
+            "❌ Archive uses a compression method this server's "
+            "extractor can't handle (likely a fresh RAR5 codec).\n"
+            "💡 Install a newer `p7zip-full` and the proprietary "
+            "`unrar` binary, then retry."
+        )
+    if "wrong password" in low or "data error" in low and "encrypted" in low:
+        return (
+            "❌ Extraction failed — looks like the password is wrong "
+            "for at least one archive. Re-run /start and double-check."
+        )
+    return f"❌ Error: {msg}"
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +519,10 @@ async def on_keywords(
 
     context.user_data["keywords"] = keywords
     await _submit_job(update, context)
+    # The conversation handler is done as soon as the job is queued —
+    # the runner takes over the status message and the user can /start
+    # another job (or /queue) right away.
+    context.user_data.clear()
     return ConversationHandler.END
 
 
@@ -530,19 +604,12 @@ async def _submit_job(
 
     asyncio.create_task(_watch_queue_position())
 
-    # Wait for the job to finish so the conversation handler returns
-    # cleanly (errors are already surfaced to the user inside the
-    # runner; we only re-raise CancelledError).
-    try:
-        if job.task is not None:
-            await job.task
-    except asyncio.CancelledError:
-        return
-    except Exception:  # noqa: BLE001
-        # Already logged + reported by the runner.
-        return
-    finally:
-        context.user_data.clear()
+    # NOTE: we deliberately do *not* `await job.task` here. Returning
+    # immediately means the conversation handler ends as soon as the
+    # job is queued, which lets the user fire off another /start
+    # without waiting for the previous job's download to finish.
+    # Errors are still surfaced in-band by the runner via the status
+    # message edits.
 
 
 async def _run_pipeline_for_job(
@@ -557,80 +624,128 @@ async def _run_pipeline_for_job(
     started = time.time()
     loop = asyncio.get_event_loop()
     last_text = ""
+    last_edit_at = 0.0
+    edit_lock = asyncio.Lock()
+    pending_text: Optional[str] = None
 
-    async def _edit(text: str) -> None:
-        nonlocal last_text
-        if text == last_text:
-            return
-        last_text = text
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg_id,
-                text=text,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+    async def _flush_edit() -> None:
+        """Apply the most recent pending text, respecting the rate limit.
+
+        Multiple ``_post_status``/``_post_progress`` calls between
+        flushes simply overwrite ``pending_text`` — we never queue up
+        a backlog of stale edits.
+        """
+        nonlocal last_text, last_edit_at, pending_text
+        async with edit_lock:
+            text = pending_text
+            pending_text = None
+            if text is None or text == last_text:
+                return
+            wait = EDIT_MIN_INTERVAL - (time.time() - last_edit_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg_id,
+                    text=text,
+                )
+                last_text = text
+                last_edit_at = time.time()
+            except RetryAfter as exc:
+                # Telegram is throttling us — back off and try once
+                # more on the next tick rather than dropping the edit.
+                last_edit_at = time.time() + float(exc.retry_after or 1.0)
+            except TimedOut:
+                # Transient — let the next flush take over.
+                pass
+            except Exception as exc:  # noqa: BLE001
+                # ``Message is not modified`` is harmless and we don't
+                # want to spam the log with it on every duplicate.
+                if "not modified" not in str(exc).lower():
+                    log.debug("edit failed: %s", exc)
+
+    def _schedule_edit(text: str) -> None:
+        nonlocal pending_text
+        pending_text = text
+        asyncio.run_coroutine_threadsafe(_flush_edit(), loop)
+
+    async def _edit_async(text: str) -> None:
+        nonlocal pending_text
+        pending_text = text
+        await _flush_edit()
 
     def _post_status(line: str) -> None:
         elapsed = int(time.time() - started)
         body = f"{line}\n⏱️ Elapsed: {elapsed}s"
-        asyncio.run_coroutine_threadsafe(_edit(body), loop)
+        _schedule_edit(body)
 
-    def _post_progress(read: int, total: Optional[int]) -> None:
+    def _post_progress(
+        read: int,
+        total: Optional[int],
+        speed: Optional[float] = None,
+    ) -> None:
         elapsed = int(time.time() - started)
+        eta = _human_eta(read, total, speed)
         body = (
             "⏳ Downloading...\n"
             f"{_progress_bar(read, total)}\n"
+            f"🚀 {_human_speed(speed)}    🎯 ETA {eta}\n"
             f"⏱️ Elapsed: {elapsed}s"
         )
-        asyncio.run_coroutine_threadsafe(_edit(body), loop)
+        _schedule_edit(body)
 
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
         try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: run_pipeline_multi(
-                    list(urls),
-                    workdir,
-                    passwords=list(passwords),
-                    keywords=keywords,
-                    max_bytes=MAX_DOWNLOAD_BYTES,
-                    on_status=_post_status,
-                    on_progress=_post_progress,
-                ),
+            result = await asyncio.to_thread(
+                run_pipeline_multi,
+                list(urls),
+                workdir,
+                passwords=list(passwords),
+                keywords=keywords,
+                max_bytes=MAX_DOWNLOAD_BYTES,
+                on_status=_post_status,
+                on_progress=_post_progress,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("pipeline failed for %s", urls)
-            await _edit(f"❌ Error: {exc}")
+            await _edit_async(_friendly_pipeline_error(exc))
             return
 
         elapsed = int(time.time() - started)
+        partial = ""
+        if getattr(result, "errors", None):
+            err_lines = "\n".join(
+                f"  • link #{idx}: {msg}"
+                for idx, msg in result.errors
+            )
+            partial = f"\n⚠️ {len(result.errors)} link(s) failed:\n{err_lines}"
+
         if result.cookie_count == 0:
-            await _edit(
+            await _edit_async(
                 "ℹ️ Done — no matching cookies found.\n"
                 f"📡 Read: {_human_bytes(result.bytes_read)} from "
                 f"{len(urls)} link(s)\n"
-                f"⏱️ Elapsed: {elapsed}s"
+                f"⏱️ Elapsed: {elapsed}s" + partial
             )
             return
 
         zip_size = result.zip_path.stat().st_size
 
         if zip_size > DOC_UPLOAD_LIMIT:
-            await _edit(
+            await _edit_async(
                 f"❌ Result zip is too large for Telegram "
                 f"({_human_bytes(zip_size)} > "
                 f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
                 f"📦 {len(result.cookie_files)} cookie set(s) — "
                 f"{result.cookie_count} cookies\n"
-                "Tip: re-run with a stricter keyword filter to shrink "
-                "the result."
+                "💡 Tip: re-run with a stricter keyword filter to "
+                "shrink the result." + partial
             )
             return
 
-        await _edit(
+        await _edit_async(
             "📤 Uploading result...\n"
             f"📦 {len(result.cookie_files)} cookie set(s) — "
             f"{result.cookie_count} cookies\n"
@@ -650,10 +765,10 @@ async def _run_pipeline_for_job(
                     f"⏱️ {elapsed}s"
                 ),
             )
-        await _edit(
+        await _edit_async(
             f"✅ Done! Sent {_human_bytes(zip_size)} "
             f"({len(result.cookie_files)} sets, "
-            f"{result.cookie_count} cookies)."
+            f"{result.cookie_count} cookies)." + partial
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -942,6 +1057,16 @@ def _check_extractor_binaries() -> None:
         )
     else:
         log.info("7z binary OK: %s (handles zip, 7z, rar)", sevenzip)
+
+    unrar = _first_on_path(UNRAR_BINARIES)
+    if unrar is None:
+        log.info(
+            "unrar binary not on PATH — fine for zip/7z/older RAR, "
+            "but install `unrar` if your users send fresh RAR5 "
+            "archives that p7zip rejects with 'Unsupported Method'."
+        )
+    else:
+        log.info("unrar binary OK: %s (RAR5 fallback enabled)", unrar)
 
 
 def main() -> None:
