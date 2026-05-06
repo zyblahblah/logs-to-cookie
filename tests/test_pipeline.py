@@ -17,7 +17,7 @@ from typing import Iterator
 
 import pytest
 
-from pipeline import run_pipeline
+from pipeline import run_pipeline, run_pipeline_multi
 
 
 GOOD_LINE_A = (
@@ -196,3 +196,179 @@ def test_pipeline_archive_url_without_extension(tmp_path: Path) -> None:
     with zipfile.ZipFile(result.zip_path) as z:
         names = sorted(z.namelist())
     assert all(n.endswith(".txt") for n in names if not n.endswith("/"))
+
+
+def test_pipeline_multi_merges_two_plain_text_urls(tmp_path: Path) -> None:
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    body_b = (f"{GOOD_LINE_B}\n").encode("utf-8")
+
+    with serve(body_a) as url_a, serve(body_b) as url_b:
+        result = run_pipeline_multi([url_a, url_b], tmp_path)
+
+    assert result.cookie_count == 2
+    assert len(result.cookie_files) == 2
+    assert result.zip_path.exists()
+    with zipfile.ZipFile(result.zip_path) as z:
+        names = sorted(z.namelist())
+    # File names embed the source URL index so users can tell which
+    # cookie set came from which link.
+    assert any("url01" in n for n in names)
+    assert any("url02" in n for n in names)
+
+
+def test_pipeline_multi_keyword_filter_applies_to_all(tmp_path: Path) -> None:
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")  # netflix
+    body_b = (f"{GOOD_LINE_B}\n").encode("utf-8")  # example.com
+
+    with serve(body_a) as url_a, serve(body_b) as url_b:
+        result = run_pipeline_multi(
+            [url_a, url_b], tmp_path, keywords=["netflix"]
+        )
+    assert result.cookie_count == 1
+    assert len(result.cookie_files) == 1
+    body = result.cookie_files[0].read_text(encoding="utf-8")
+    assert "netflix" in body.lower()
+    assert "example.com" not in body
+
+
+def test_pipeline_multi_partial_failure_keeps_good_results(
+    tmp_path: Path,
+) -> None:
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    with serve(body_a) as url_a:
+        # url_b is intentionally a port that nothing's listening on, so
+        # the second download will fail. The first should still succeed.
+        bad_url = "http://127.0.0.1:1/never-listens"
+        result = run_pipeline_multi([url_a, bad_url], tmp_path)
+
+    assert result.cookie_count == 1
+    assert len(result.cookie_files) == 1
+    assert result.bytes_read >= len(body_a)
+
+
+def test_pipeline_multi_passwords_length_mismatch_raises(tmp_path: Path) -> None:
+    body = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    with serve(body) as url_a, serve(body) as url_b:
+        with pytest.raises(ValueError, match="passwords has"):
+            run_pipeline_multi(
+                [url_a, url_b],
+                tmp_path,
+                passwords=["only-one"],  # 1 password, 2 URLs
+            )
+
+
+def test_pipeline_multi_passwords_list_overrides_single(tmp_path: Path) -> None:
+    """When both ``password=`` and ``passwords=`` are given, the list wins."""
+    body_a = (f"{GOOD_LINE_A}\n").encode("utf-8")
+    body_b = (f"{GOOD_LINE_B}\n").encode("utf-8")
+
+    # Both URLs are plain text, so the password is unused; we're just
+    # verifying that supplying the list doesn't break anything and that
+    # both URLs are still processed.
+    with serve(body_a) as url_a, serve(body_b) as url_b:
+        result = run_pipeline_multi(
+            [url_a, url_b],
+            tmp_path,
+            password="ignored-because-list-wins",
+            passwords=["per-url-a", None],
+        )
+
+    assert result.cookie_count == 2
+    assert len(result.cookie_files) == 2
+
+
+@pytest.mark.skipif(
+    shutil.which("7z") is None
+    and shutil.which("7za") is None
+    and shutil.which("7zz") is None,
+    reason="7z binary not available on this host",
+)
+def test_pipeline_multi_per_url_passwords_decrypt_correctly(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: two encrypted archives with *different* passwords."""
+    import subprocess
+
+    sevenzip = (
+        shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+    )
+    assert sevenzip is not None  # for type checkers
+
+    archives: list[bytes] = []
+    passwords = ["pwd-alpha", "pwd-beta"]
+    for label, line, pwd in (
+        ("alpha", GOOD_LINE_A, passwords[0]),
+        ("beta", GOOD_LINE_B, passwords[1]),
+    ):
+        src_root = tmp_path / f"src_{label}"
+        (src_root / f"victim_{label}").mkdir(parents=True)
+        (src_root / f"victim_{label}" / "cookies.txt").write_text(
+            f"{line}\n", encoding="utf-8"
+        )
+        archive_path = tmp_path / f"logs_{label}.zip"
+        # ``-mhe=on`` would also encrypt headers but only for 7z; for
+        # zip we just rely on per-file encryption with the password.
+        subprocess.run(
+            [
+                sevenzip,
+                "a",
+                "-tzip",
+                f"-p{pwd}",
+                str(archive_path),
+                str(src_root) + "/.",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        archives.append(archive_path.read_bytes())
+
+    work = tmp_path / "work"
+    with serve_zip(archives[0], url_path="/a.zip") as url_a, serve_zip(
+        archives[1], url_path="/b.zip"
+    ) as url_b:
+        result = run_pipeline_multi(
+            [url_a, url_b],
+            work,
+            passwords=passwords,
+        )
+
+    assert result.cookie_count == 2
+    assert len(result.cookie_files) == 2
+
+
+@pytest.mark.skipif(
+    shutil.which("7z") is None
+    and shutil.which("7za") is None
+    and shutil.which("7zz") is None,
+    reason="7z binary not available on this host",
+)
+def test_pipeline_multi_archives_merge_into_one_zip(tmp_path: Path) -> None:
+    """Two zip URLs → all victims show up in the merged result zip."""
+    archives: list[bytes] = []
+    for label, line in (("alpha", GOOD_LINE_A), ("beta", GOOD_LINE_B)):
+        src_root = tmp_path / f"src_{label}"
+        (src_root / f"victim_{label}").mkdir(parents=True)
+        (src_root / f"victim_{label}" / "cookies.txt").write_text(
+            f"{line}\n", encoding="utf-8"
+        )
+        archive_path = tmp_path / f"logs_{label}.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            for p in src_root.rglob("*"):
+                if p.is_file():
+                    z.write(p, arcname=p.relative_to(src_root).as_posix())
+        archives.append(archive_path.read_bytes())
+
+    work = tmp_path / "work"
+    with serve_zip(archives[0], url_path="/a.zip") as url_a, serve_zip(
+        archives[1], url_path="/b.zip"
+    ) as url_b:
+        result = run_pipeline_multi([url_a, url_b], work)
+
+    assert len(result.cookie_files) == 2
+    assert result.cookie_count == 2
+    with zipfile.ZipFile(result.zip_path) as z:
+        names = sorted(z.namelist())
+    assert any("alpha" in n for n in names)
+    assert any("beta" in n for n in names)
+    # And the URL-index tag is present on every output filename.
+    assert all("url0" in n for n in names if n.endswith(".txt"))

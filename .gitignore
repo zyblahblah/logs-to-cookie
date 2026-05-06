@@ -9,6 +9,9 @@ venv/
 env/
 .env
 
+# Bot persistent state (VIP allow-list + redemption keys)
+state.json
+
 # Bot runtime artifacts
 output/
 results/
