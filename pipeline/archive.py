@@ -348,17 +348,7 @@ def _is_retryable(stderr_blob: str) -> bool:
         # can't. Retry with libarchive (``bsdtar``) which handles
         # RAR4/RAR5 in many of these cases.
         return True
-    if any(frag in low for frag in _RETRYABLE_ERROR_FRAGMENTS):
-        # The placeholder " failed" fragment listed above would
-        # over-match (e.g. "asprintf failed: ..."), so route the
-        # actual " <num> Failed" check through the regex above and
-        # ignore it here.
-        return any(
-            frag in low
-            for frag in _RETRYABLE_ERROR_FRAGMENTS
-            if frag != " failed"
-        )
-    return False
+    return any(frag in low for frag in _RETRYABLE_ERROR_FRAGMENTS)
 
 
 def _is_password_error(stderr_blob: str) -> bool:
