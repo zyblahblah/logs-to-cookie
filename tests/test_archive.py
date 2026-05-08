@@ -155,3 +155,203 @@ def test_extract_garbage_raises_with_clear_message(tmp_path: Path) -> None:
     bogus.write_bytes(b"this is just plain text, not an archive\n" * 10)
     with pytest.raises(ArchiveError, match="magic bytes"):
         extract_archive(bogus, tmp_path / "out")
+
+
+# ---------------------------------------------------------------------------
+# Pure-string error-classification helpers. We test them directly so we
+# don't have to actually invoke an extractor against every possible
+# archive variant (RAR4 vs RAR5, header-encrypted .7z, etc.).
+# ---------------------------------------------------------------------------
+from pipeline.archive import (  # noqa: E402
+    _is_password_error,
+    _is_retryable,
+    _last_useful_line,
+)
+
+
+# Real p7zip 16.02 stderr captured locally. Reproduces the exact
+# scenario the user hit in the bug report (".rar / .7z gives `❌ Error:
+# extraction failed: Compressed: 0`").
+P7ZIP_NOT_AN_ARCHIVE_BLOB = """\
+
+7-Zip [64] 16.02 : Copyright (c) 1999-2016 Igor Pavlov : 2016-05-21
+p7zip Version 16.02 (locale=C.UTF-8,Utf16=on,HugeFiles=on,64 bits,...)
+
+Scanning the drive for archives:
+1 file, 14 bytes (1 KiB)
+
+Extracting archive: fake.rar
+ERROR: fake.rar
+Can not open the file as archive
+
+
+Can't open as archive: 1
+Files: 0
+Size:       0
+Compressed: 0
+"""
+
+# Real p7zip 16.02 stderr for an encrypted .7z opened without a password.
+P7ZIP_ENCRYPTED_BLOB = """\
+
+7-Zip [64] 16.02 : Copyright (c) 1999-2016 Igor Pavlov : 2016-05-21
+p7zip Version 16.02 (locale=C.UTF-8,Utf16=on,HugeFiles=on,64 bits,...)
+
+Scanning the drive for archives:
+1 file, 231 bytes (1 KiB)
+
+Extracting archive: encrypted.7z
+ERROR: encrypted.7z
+Can not open encrypted archive. Wrong password?
+
+ERRORS:
+Headers Error
+
+Can't open as archive: 1
+Files: 0
+Size:       0
+Compressed: 0
+"""
+
+
+class TestIsRetryable:
+    """Make sure the bot recognises every variant of "this isn't an archive"
+    so it can fall through to the next extractor instead of giving up
+    immediately and reporting `Compressed: 0`."""
+
+    def test_p7zip_can_not_open_with_space(self) -> None:
+        # p7zip 16.02 (Debian/Ubuntu): "Can not open the file as archive"
+        assert _is_retryable(P7ZIP_NOT_AN_ARCHIVE_BLOB) is True
+
+    def test_seven_zip_cannot_open_no_space(self) -> None:
+        # Upstream 7-Zip / 7zz: "Cannot open the file as archive"
+        assert _is_retryable("ERROR: foo\nCannot open the file as archive\n") is True
+
+    def test_p7zip_summary_canT_open(self) -> None:
+        # The summary footer "Can't open as archive: 1" alone should
+        # also route through the retryable path.
+        assert _is_retryable("Can't open as archive: 1\nFiles: 0\n") is True
+
+    def test_unsupported_method_is_retryable(self) -> None:
+        assert _is_retryable("ERROR: Unsupported Method foo.7z") is True
+
+    def test_wrong_password_is_NOT_retryable(self) -> None:
+        # A bad password is decisive — the next extractor will hit the
+        # same wall, and looping over every binary just spams logs.
+        assert _is_retryable(P7ZIP_ENCRYPTED_BLOB) is False
+        assert _is_retryable("ERROR: Wrong password? in foo.zip") is False
+
+    def test_clean_run_is_not_retryable(self) -> None:
+        assert _is_retryable("Everything is Ok\n") is False
+
+
+class TestIsPasswordError:
+    def test_p7zip_encrypted_no_password(self) -> None:
+        assert _is_password_error(P7ZIP_ENCRYPTED_BLOB) is True
+
+    def test_wrong_password_phrase(self) -> None:
+        assert _is_password_error("ERROR: Wrong password?\n") is True
+
+    def test_headers_error_alone(self) -> None:
+        # Header-encrypted .7z without a password sometimes prints
+        # only "Headers Error" — still a password problem.
+        assert _is_password_error("ERRORS:\nHeaders Error\n") is True
+
+    def test_plain_failure_is_not_password_error(self) -> None:
+        assert _is_password_error(P7ZIP_NOT_AN_ARCHIVE_BLOB) is False
+        assert _is_password_error("Everything is Ok") is False
+
+
+class TestLastUsefulLine:
+    """``_last_useful_line`` must skip the 7z summary footer so the
+    bot reports the *real* failure to the user instead of `Compressed:
+    0`."""
+
+    def test_strips_compressed_zero_footer(self) -> None:
+        # This is the exact regression from the bug report: the user
+        # saw ``❌ Error: extraction failed: Compressed: 0`` when 7z
+        # actually said "Can not open the file as archive". The new
+        # behaviour returns the real diagnostic line instead.
+        line = _last_useful_line(P7ZIP_NOT_AN_ARCHIVE_BLOB)
+        assert "Can not open the file as archive" in line
+        assert "compressed" not in line.lower()
+        assert "files: 0" not in line.lower()
+
+    def test_strips_summary_for_encrypted(self) -> None:
+        line = _last_useful_line(P7ZIP_ENCRYPTED_BLOB)
+        # Should land on either the "Wrong password?" line or the
+        # bare "Headers Error" line — either way, NOT "Compressed: 0".
+        low = line.lower()
+        assert "compressed" not in low
+        assert "files:" not in low
+        assert "size:" not in low
+        assert "wrong password" in low or "headers error" in low
+
+    def test_returns_extraction_failed_when_blob_is_empty(self) -> None:
+        assert _last_useful_line("") == "extraction failed"
+
+    def test_returns_only_line_when_no_noise(self) -> None:
+        assert _last_useful_line("just one diagnostic line\n") == (
+            "just one diagnostic line"
+        )
+
+    def test_skips_blank_and_bare_error_lines(self) -> None:
+        blob = "\n\nERRORS\n\nthe real error\nFiles: 0\nCompressed: 0\n"
+        assert _last_useful_line(blob) == "the real error"
+
+
+class TestExtractArchiveSurfacesPasswordErrors:
+    """End-to-end test: when 7z reports a wrong/missing password, the
+    bot raises a ``ArchiveError`` with a phrase the friendly-message
+    translator can match on (NOT ``Compressed: 0``)."""
+
+    @pytest.mark.skipif(
+        shutil.which("7z") is None
+        and shutil.which("7za") is None
+        and shutil.which("7zz") is None,
+        reason="7z binary not available on this host",
+    )
+    def test_encrypted_7z_without_password(self, tmp_path: Path) -> None:
+        """Build a header-encrypted .7z and try to extract it without a
+        password. Must surface a password-shaped error, not the
+        ``Compressed: 0`` summary footer."""
+        import subprocess
+
+        seven = (
+            shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+        )
+        assert seven is not None
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "cookies.txt").write_text("hello\n", encoding="utf-8")
+        archive = tmp_path / "encrypted.7z"
+        # ``-mhe=on`` = header encryption (without it the password
+        # prompt only blocks file *contents*, not archive listing).
+        result = subprocess.run(
+            [
+                seven,
+                "a",
+                "-y",
+                "-pcorrect-password",
+                "-mhe=on",
+                str(archive),
+                str(src_dir / "cookies.txt"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        out = tmp_path / "out"
+        with pytest.raises(ArchiveError) as exc:
+            extract_archive(archive, out, password=None)
+        msg = str(exc.value).lower()
+        # The exact phrase the bot's _friendly_pipeline_error matches
+        # on — must NOT regress to "Compressed: 0".
+        assert "compressed: 0" not in msg
+        assert (
+            "no password was supplied" in msg
+            or "wrong password" in msg
+            or "encrypted" in msg
+        )

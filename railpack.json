@@ -1,6 +1,11 @@
 {
   "$schema": "https://schema.railpack.com",
   "deploy": {
-    "aptPackages": ["p7zip-full"]
+    "aptPackages": [
+      "p7zip-full",
+      "p7zip-rar",
+      "unrar-free",
+      "libarchive-tools"
+    ]
   }
 }
