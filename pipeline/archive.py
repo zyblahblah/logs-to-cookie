@@ -230,13 +230,37 @@ def _build_unrar_cmd(
     return cmd
 
 
-def _run(cmd: List[str], timeout: int) -> Tuple[int, str]:
-    """Run a subprocess and return (returncode, last_useful_line)."""
+def _decode_subproc_bytes(data: Optional[bytes]) -> str:
+    """Decode subprocess output bytes tolerantly.
+
+    7z and unrar print archive entry names verbatim — for archives
+    that originated on a non-UTF-8 system (Windows stealer logs are
+    routinely cp1252 / cp866 / cp936) those names are not valid
+    UTF-8. ``subprocess.run(..., text=True)`` strict-decodes with the
+    locale encoding, which raises ``UnicodeDecodeError`` and crashes
+    the pipeline before the bot ever gets a chance to surface a
+    useful error. Capturing as bytes and decoding with
+    ``errors='replace'`` here keeps the diagnostic intact (the file
+    *was* extracted; we only want a printable representation of the
+    extractor's chatter for logging and error-classification).
+    """
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _run_subproc(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run an extractor and return the raw ``CompletedProcess``.
+
+    Output is captured as bytes (``text=False``) so callers can
+    decode tolerantly via :func:`_decode_subproc_bytes` — see that
+    helper's docstring for why strict UTF-8 decoding is wrong here.
+    """
     try:
-        proc = subprocess.run(
+        return subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=timeout,
             check=False,
         )
@@ -245,7 +269,13 @@ def _run(cmd: List[str], timeout: int) -> Tuple[int, str]:
     except FileNotFoundError as exc:
         raise ArchiveError(f"extractor binary not found: {exc}") from exc
 
-    stderr_lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+
+def _run(cmd: List[str], timeout: int) -> Tuple[int, str]:
+    """Run a subprocess and return (returncode, last_useful_line)."""
+    proc = _run_subproc(cmd, timeout)
+    stderr = _decode_subproc_bytes(proc.stderr)
+    stdout = _decode_subproc_bytes(proc.stdout)
+    stderr_lines = (stderr or stdout or "").strip().splitlines()
     tail = stderr_lines[-1] if stderr_lines else f"rc={proc.returncode}"
     return proc.returncode, tail
 
@@ -257,20 +287,12 @@ def _stderr_blob(cmd: List[str], timeout: int) -> Tuple[int, str]:
     failure as "retryable" because the meaningful "Unsupported Method"
     line is sometimes followed by a generic "ERROR: ..." footer.
     """
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ArchiveError(f"extraction timed out after {timeout}s") from exc
-    except FileNotFoundError as exc:
-        raise ArchiveError(f"extractor binary not found: {exc}") from exc
-
-    blob = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+    proc = _run_subproc(cmd, timeout)
+    blob = (
+        _decode_subproc_bytes(proc.stderr)
+        + "\n"
+        + _decode_subproc_bytes(proc.stdout)
+    ).strip()
     return proc.returncode, blob
 
 

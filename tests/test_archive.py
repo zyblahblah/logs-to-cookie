@@ -163,10 +163,13 @@ def test_extract_garbage_raises_with_clear_message(tmp_path: Path) -> None:
 # archive variant (RAR4 vs RAR5, header-encrypted .7z, etc.).
 # ---------------------------------------------------------------------------
 from pipeline.archive import (  # noqa: E402
+    _decode_subproc_bytes,
     _dest_has_files,
     _is_password_error,
     _is_retryable,
     _last_useful_line,
+    _run,
+    _stderr_blob,
 )
 
 
@@ -334,6 +337,72 @@ class TestDestHasFiles:
     def test_missing_dir_is_false(self, tmp_path: Path) -> None:
         # Defensive: should not raise, just report "no files".
         assert _dest_has_files(tmp_path / "does-not-exist") is False
+
+
+class TestDecodeSubprocBytes:
+    """Pin the regression that caused the user-visible
+    ``'utf-8' codec can't decode byte 0xa0 …`` error: 7z prints
+    archive entry names verbatim and Windows-origin stealer logs
+    routinely use cp1252 / cp866 / cp936 filenames. We must NOT
+    strict-decode."""
+
+    def test_returns_empty_for_none(self) -> None:
+        assert _decode_subproc_bytes(None) == ""
+
+    def test_returns_empty_for_empty_bytes(self) -> None:
+        assert _decode_subproc_bytes(b"") == ""
+
+    def test_decodes_clean_utf8(self) -> None:
+        assert _decode_subproc_bytes(b"hello\n") == "hello\n"
+
+    def test_replaces_invalid_bytes_instead_of_raising(self) -> None:
+        # 0xa0 alone is never a valid UTF-8 start byte; cp1252
+        # interprets it as a non-breaking space, which is exactly
+        # what the user's archive contained.
+        out = _decode_subproc_bytes(b"Extracting\xa0file.txt\n")
+        # Must not raise UnicodeDecodeError; the offending byte is
+        # replaced with U+FFFD so the surrounding diagnostic
+        # ("Extracting", "file.txt") is preserved.
+        assert "Extracting" in out
+        assert "file.txt" in out
+        assert "\ufffd" in out
+
+
+class TestSubprocByteToleration:
+    """End-to-end: when 7z (or any extractor) emits non-UTF-8
+    bytes, the helpers in archive.py must capture them as bytes
+    and decode tolerantly. Before this fix, ``subprocess.run`` was
+    called with ``text=True`` which strict-decoded the bytes and
+    crashed the entire pipeline with the exact message the user
+    reported in the bug screenshot."""
+
+    @pytest.fixture
+    def emit_invalid_utf8(self) -> list[str]:
+        # Reproduce the user-visible error exactly: emit a 0xa0
+        # byte at position 147 of the subprocess output, the same
+        # offset Python reported in their crash.
+        return [
+            "bash",
+            "-c",
+            r'printf "%-147s\xa0invalid_filename.txt\n" "Extracting:"',
+        ]
+
+    def test_run_does_not_raise_unicode_decode_error(
+        self, emit_invalid_utf8: list[str]
+    ) -> None:
+        rc, line = _run(emit_invalid_utf8, timeout=10)
+        assert rc == 0
+        # Replacement char preserves the surrounding context.
+        assert "Extracting" in line
+        assert "invalid_filename.txt" in line
+
+    def test_stderr_blob_does_not_raise_unicode_decode_error(
+        self, emit_invalid_utf8: list[str]
+    ) -> None:
+        rc, blob = _stderr_blob(emit_invalid_utf8, timeout=10)
+        assert rc == 0
+        assert "Extracting" in blob
+        assert "invalid_filename.txt" in blob
 
 
 class TestExtractArchiveSurfacesPasswordErrors:
