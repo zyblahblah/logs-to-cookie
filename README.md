@@ -96,10 +96,11 @@ include the RAR codec** — it lives in the separate non-free
 `p7zip-rar` package. So on Debian/Ubuntu you want at least one of:
 
 ```bash
-# Easiest: p7zip + the RAR codec + a free unrar fallback.
-sudo apt-get install -y p7zip-full p7zip-rar unrar-free libarchive-tools
-# Or, if you can enable multiverse, the proprietary unrar:
-sudo apt-get install -y p7zip-full unrar libarchive-tools
+# Most reliable: free RAR readers from main / universe (works on any
+# Debian/Ubuntu base image, including locked-down PaaS runtimes).
+sudo apt-get install -y p7zip-full unrar-free libarchive-tools
+# Or, if you can enable multiverse, the proprietary unrar / p7zip-rar:
+sudo apt-get install -y p7zip-full p7zip-rar unrar libarchive-tools
 ```
 
 The bot tries every extractor on `$PATH` in turn — `7zz` / `7z` /
@@ -113,7 +114,7 @@ the bot more codecs to fall back on for stubborn RAR archives.
 2. Open *Variables* and set:
    - `BOT_TOKEN` — token from [@BotFather](https://t.me/BotFather)
    - `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended).
-3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `railpack.json` installs `p7zip-full`, `p7zip-rar`, `unrar-free`, and `libarchive-tools` (via apt in the deploy image) so encrypted archives — zip, 7z, and rar — work out of the box; `nixpacks.toml` is kept around for older Railway services / self-hosters that build with Nixpacks.
+3. Deploy. Railway runs `worker: python bot.py` (see `Procfile`). `railpack.json` installs `p7zip-full`, `unrar-free`, and `libarchive-tools` (via apt in the deploy image) so encrypted archives — zip, 7z, and rar — work out of the box; `nixpacks.toml` is kept around for older Railway services / self-hosters that build with Nixpacks.
 
 > **Heads up — Railway uses Railpack, not Nixpacks, by default since
 > mid-2025.** That's why an earlier version of this README (which only
@@ -128,15 +129,18 @@ the bot more codecs to fall back on for stubborn RAR archives.
 > An earlier version of this README claimed it could; that's only
 > true for the upstream 7-Zip `7zz` build, not the `p7zip-full`
 > package shipped on Ubuntu (16.02). The codec ships separately as
-> `p7zip-rar`, and there's also `unrar-free` (GPL, in main) and
-> `libarchive-tools` (`bsdtar`) as alternative RAR readers. The
-> current `railpack.json` installs all four so .rar logs work
-> regardless of which extractor the host's package mirror has
-> available; if you forked an older copy that only listed
-> `p7zip-full`, replace it with the version in this repo. Symptom
-> of the missing codec is `❌ Error: extraction failed: Compressed:
-> 0` (a useless 7z summary line that the bot now translates into a
-> proper "install `p7zip-rar`" hint).
+> the non-free `p7zip-rar` package (in *multiverse*, which Railpack's
+> base image does not enable), so the `railpack.json` in this repo
+> instead installs `unrar-free` (GPL, in *universe*) and
+> `libarchive-tools` (`bsdtar`, in *universe*). Between them they
+> handle both RAR4 and RAR5; the bot's fallback chain walks every
+> extractor on `$PATH` until one succeeds. If you self-host on a
+> machine that has multiverse enabled and want maximum codec
+> coverage, you can additionally install `p7zip-rar` and / or the
+> proprietary `unrar` — the bot will pick them up automatically.
+> Symptom of a missing RAR codec is `❌ Error: extraction failed:
+> Compressed: 0` (a useless 7z summary line that the bot now
+> translates into a proper "install `p7zip-rar`" hint).
 
 > **Rotate your token.** Anyone who has seen your bot token can
 > control the bot. If you've ever pasted it in chat, run

@@ -165,6 +165,21 @@ def _all_on_path(candidates: Sequence[str]) -> List[str]:
     return out
 
 
+def _dest_has_files(dest_dir: Path) -> bool:
+    """Return True iff ``dest_dir`` contains at least one regular file
+    (recursively). ``unrar-free`` and a few other extractors return
+    rc=0 even when they fail to actually extract anything — checking
+    the filesystem is the only reliable signal.
+    """
+    try:
+        for entry in dest_dir.rglob("*"):
+            if entry.is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _which_first(candidates: Sequence[str]) -> Optional[str]:
     found = _all_on_path(candidates)
     return found[0] if found else None
@@ -371,12 +386,31 @@ def extract_archive(
     last_bin = ""
     for bin_path, cmd in candidates:
         rc, blob = _stderr_blob(cmd, timeout)
-        if rc == 0:
+        if rc == 0 and _dest_has_files(dest_dir):
             log.info(
                 "extraction OK with %s",
                 Path(bin_path).name,
             )
             return dest_dir
+        if rc == 0:
+            # Some extractors (notably ``unrar-free`` 0.0.2) return
+            # rc=0 even when they fail to actually extract anything
+            # — a corrupt RAR or one with an unsupported codec just
+            # produces an empty destination directory. Treat that as
+            # a retryable failure so the next extractor still gets a
+            # chance.
+            blob = (
+                f"{blob}\nextractor {Path(bin_path).name} reported "
+                "success but produced no files (treating as is not archive)"
+            )
+            log.info(
+                "extractor %s rc=0 but dest is empty — "
+                "treating as retryable failure",
+                Path(bin_path).name,
+            )
+            last_blob = blob
+            last_bin = bin_path
+            continue
         last_blob = blob
         last_bin = bin_path
         retryable = _is_retryable(blob)
