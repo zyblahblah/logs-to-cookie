@@ -80,6 +80,18 @@ _RETRYABLE_ERROR_FRAGMENTS: tuple[str, ...] = (
     # fall through to bsdtar / libarchive.
     "unknown archive type",
     "only plain rar 2.0 supported",
+    # ``bsdtar`` (libarchive) on a RAR5 archive whose codec it
+    # doesn't fully support emits something like:
+    #     <name>: Unsupported block header size (was 5, max is 2):
+    #         No such file or directory
+    #     bsdtar: Error exit delayed from previous errors.
+    # This is the LAST extractor in the chain, so without flagging
+    # the failure as retryable the bot raises libarchive's noisy
+    # tail verbatim and the codec-gap rewrite (which gives the user
+    # actionable advice) never fires. Both phrases below are stable
+    # libarchive messages.
+    "unsupported block header size",
+    "error exit delayed",
 )
 
 
@@ -478,6 +490,13 @@ def extract_archive(
 
     last_blob = ""
     last_bin = ""
+    # ``all_blobs`` accumulates every extractor's diagnostic across the
+    # whole chain. Without it the codec-gap rewrite below would only
+    # see the LAST extractor's output (e.g. ``bsdtar``'s noisy
+    # "Error exit delayed from previous errors") and we'd miss the
+    # earlier, more diagnostic ``unrar-free`` "only plain RAR 2.0"
+    # / ``<num> Failed`` line that names the actual problem.
+    all_blobs: List[str] = []
     for bin_path, cmd in candidates:
         # Each extractor must start with a clean ``dest_dir``. Otherwise
         # a previous attempt's leftovers would be misread as proof of
@@ -518,9 +537,11 @@ def extract_archive(
             )
             last_blob = blob
             last_bin = bin_path
+            all_blobs.append(blob)
             continue
         last_blob = blob
         last_bin = bin_path
+        all_blobs.append(blob)
         retryable = _is_retryable(blob)
         log.info(
             "extractor %s rc=%d, retryable=%s",
@@ -557,10 +578,15 @@ def extract_archive(
     # surfaced verbatim are useless to the user, so rewrite the
     # leading diagnostic to name the codec gap explicitly. The
     # bot's ``_friendly_pipeline_error`` keys off this exact phrase.
-    low = last_blob.lower()
+    # Scan ``all_blobs`` (not just ``last_blob``) so the rewrite
+    # still fires when bsdtar's libarchive noise is the LAST blob
+    # but unrar-free's codec-gap signal showed up earlier.
+    aggregated = "\n".join(all_blobs)
+    low_agg = aggregated.lower()
     if (
-        _UNRAR_FREE_FAILED_RE.search(last_blob)
-        or "only plain rar 2.0 supported" in low
+        _UNRAR_FREE_FAILED_RE.search(aggregated)
+        or "only plain rar 2.0 supported" in low_agg
+        or "unknown archive type" in low_agg
     ):
         tail = (
             "unrar-free can only read RAR 2.0 archives — this one "

@@ -295,6 +295,28 @@ class TestIsRetryable:
         # — must fall through to the next extractor in the chain.
         assert _is_retryable(UNRAR_FREE_UNKNOWN_TYPE_BLOB) is True
 
+    def test_libarchive_unsupported_block_header_is_retryable(self) -> None:
+        # Real ``bsdtar`` stderr against the screenshot bug RAR5
+        # archive. Without flagging this as retryable the chain
+        # raises libarchive's noisy "Error exit delayed" tail
+        # verbatim instead of the codec-gap rewrite — i.e. the
+        # final user-visible message becomes "extraction failed:
+        # bsdtar: Error exit delayed from previous errors." which
+        # is just as useless as "485 Failed".
+        blob = (
+            "AcolyteBases.txt: Unsupported block header size "
+            "(was 5, max is 2): No such file or directory\n"
+            "bsdtar: Error exit delayed from previous errors.\n"
+        )
+        assert _is_retryable(blob) is True
+
+    def test_libarchive_error_exit_delayed_alone_is_retryable(self) -> None:
+        # Defensive: the trailing ``Error exit delayed`` line on
+        # its own (e.g. when the per-entry error gets dropped on
+        # capture) must still flag as retryable.
+        blob = "bsdtar: Error exit delayed from previous errors.\n"
+        assert _is_retryable(blob) is True
+
     def test_bare_failed_word_is_NOT_retryable(self) -> None:
         # The "<num> Failed" pattern is anchored to a number — a
         # generic "asprintf failed: out of memory" must NOT match,
@@ -734,6 +756,72 @@ class TestExtractArchiveSurfacesUnrarFreeFailure:
         # The friendly message names the underlying codec gap.
         assert "rar 2.0" in msg
         assert "rar3" in msg or "rar4" in msg or "rar5" in msg
+
+
+class TestExtractArchiveAggregatesBlobsForCodecGap:
+    """Regression for the codec-gap-message-suppression bug: when
+    the chain is 7z → unrar-free → bsdtar and the LAST extractor
+    fails with libarchive's noisy "Error exit delayed" tail, the
+    final user message must STILL surface the codec-gap rewrite
+    (named after the earlier ``unrar-free`` "<num> Failed" signal)
+    instead of leaking ``bsdtar``'s message verbatim. ``extract_archive``
+    achieves this by aggregating every extractor's blob and scanning
+    the union for the codec-gap signal."""
+
+    def test_bsdtar_last_does_not_hide_unrar_free_codec_gap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive = tmp_path / "input.rar"
+        archive.write_bytes(b"Rar!\x1a\x07\x01" + b"\x00" * 64)
+
+        from pipeline import archive as archive_mod
+
+        def fake_all_on_path(candidates: list[str]) -> list[str]:
+            # Order matters: 7z first, then unrar-free, then bsdtar
+            # — exactly what extract_archive computes for a RAR.
+            if "7z" in candidates:
+                return ["/usr/bin/7z"]
+            if "unrar-free" in candidates or "unrar" in candidates:
+                return ["/usr/bin/unrar-free"]
+            if "bsdtar" in candidates:
+                return ["/usr/bin/bsdtar"]
+            return []
+
+        # Three blobs, each from a different extractor. The LAST
+        # one is bsdtar's libarchive noise; only the MIDDLE one
+        # carries the codec-gap signal.
+        blobs = iter(
+            [
+                "ERROR: Unsupported Method\n",  # 7z
+                UNRAR_FREE_FAILED_BLOB,  # unrar-free (the signal)
+                (
+                    "AcolyteBases.txt: Unsupported block header size "
+                    "(was 5, max is 2): No such file or directory\n"
+                    "bsdtar: Error exit delayed from previous errors.\n"
+                ),  # bsdtar (noise — what last_blob alone would surface)
+            ]
+        )
+
+        def fake_stderr_blob(
+            cmd: list[str], timeout: int
+        ) -> tuple[int, str]:
+            return 1, next(blobs)
+
+        monkeypatch.setattr(archive_mod, "_all_on_path", fake_all_on_path)
+        monkeypatch.setattr(archive_mod, "_stderr_blob", fake_stderr_blob)
+
+        out = tmp_path / "out"
+        with pytest.raises(ArchiveError) as exc:
+            extract_archive(archive, out, password=None)
+        msg = str(exc.value).lower()
+        # The user MUST see the codec-gap rewrite, not bsdtar's
+        # "Error exit delayed" tail.
+        assert "rar 2.0" in msg
+        assert "rar3" in msg or "rar4" in msg or "rar5" in msg
+        assert "error exit delayed" not in msg
+        assert "unsupported block header size" not in msg
 
 
 class TestFriendlyPipelineErrorForUnrarFree:
