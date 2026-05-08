@@ -164,6 +164,7 @@ def test_extract_garbage_raises_with_clear_message(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 from pipeline.archive import (  # noqa: E402
     _all_on_path,
+    _build_unrar_cmd,
     _decode_subproc_bytes,
     _dest_has_files,
     _is_password_error,
@@ -497,6 +498,73 @@ class TestAllOnPathDedupe:
         monkeypatch.setenv("PATH", str(bin_dir))
         out = _all_on_path(["7z", "7za", "7zz"])
         assert len(out) == 3
+
+
+class TestBuildUnrarCmd:
+    """``_build_unrar_cmd`` must use the proprietary-syntax command
+    line for both ``unrar`` and ``unrar-free``.
+
+    The motivation is the screenshot bug: the GPL fork's native argp
+    parser treats ``-p`` as a no-arg toggle that just enables
+    interactive password prompting on the tty, so a password supplied
+    as ``-p PASSWORD`` (with a space) hangs at ``Password:`` waiting
+    on stdin until the bot's timeout fires. ``--password=PASSWORD``
+    is rejected outright with ``option '--password' doesn't allow an
+    argument``. The attached form ``-p<password>`` works in BOTH
+    proprietary unrar AND unrar-free's ``compat_parse_opts`` path —
+    so we always invoke that syntax."""
+
+    def test_unrar_free_uses_proprietary_syntax(self, tmp_path: Path) -> None:
+        cmd = _build_unrar_cmd(
+            "/usr/bin/unrar-free",
+            tmp_path / "input.rar",
+            tmp_path / "out",
+            "@AcolyteBases",
+        )
+        # MUST be the attached form ``-p<pwd>`` (no space) — anything
+        # else hangs unrar-free at an interactive password prompt.
+        assert "-p@AcolyteBases" in cmd
+        # Must NOT be the GNU detached form that argp rejects /
+        # silently triggers the password prompt.
+        assert "-p" not in [arg for arg in cmd if arg == "-p"]
+        assert "--password=@AcolyteBases" not in cmd
+        # Proprietary extract switches.
+        assert cmd[1:4] == ["x", "-y", "-o+"]
+
+    def test_unrar_uses_proprietary_syntax(self, tmp_path: Path) -> None:
+        cmd = _build_unrar_cmd(
+            "/usr/bin/unrar",
+            tmp_path / "input.rar",
+            tmp_path / "out",
+            "secret",
+        )
+        assert "-psecret" in cmd
+        assert cmd[1:4] == ["x", "-y", "-o+"]
+
+    def test_no_password_uses_dash_marker(self, tmp_path: Path) -> None:
+        cmd = _build_unrar_cmd(
+            "/usr/bin/unrar-free",
+            tmp_path / "input.rar",
+            tmp_path / "out",
+            None,
+        )
+        # ``-p-`` tells proprietary unrar / unrar-free's compat
+        # parser "no password" without ever prompting.
+        assert "-p-" in cmd
+
+    def test_bsdtar_uses_passphrase_flag(self, tmp_path: Path) -> None:
+        cmd = _build_unrar_cmd(
+            "/usr/bin/bsdtar",
+            tmp_path / "input.rar",
+            tmp_path / "out",
+            "secret",
+        )
+        # libarchive uses ``--passphrase`` (not ``-p``).
+        assert "--passphrase" in cmd
+        idx = cmd.index("--passphrase")
+        assert cmd[idx + 1] == "secret"
+        assert "-x" in cmd
+        assert "-f" in cmd
 
 
 class TestExtractArchiveSurfacesUnrarFreeFailure:

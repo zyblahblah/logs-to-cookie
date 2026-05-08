@@ -256,14 +256,14 @@ def _build_unrar_cmd(
         if password:
             cmd += ["--passphrase", password]
         return cmd
-    if name == "unrar-free":
-        # unrar-free uses a GNU-ish CLI: ``-x`` to extract.
-        cmd = [bin_path, "-x"]
-        if password:
-            cmd += ["-p", password]
-        cmd += [str(archive_path), str(dest_dir) + "/"]
-        return cmd
-    # Proprietary unrar (and most CLI clones).
+    # Both proprietary ``unrar`` and the GPL ``unrar-free`` fork accept
+    # the proprietary-style command line (``compat_parse_opts`` in the
+    # fork). We MUST use that — unrar-free's native argp parser
+    # treats ``-p`` as a no-arg toggle that just enables interactive
+    # password prompting, so ``-p PASSWORD`` would hang at
+    # ``Password:`` waiting on stdin and ``--password=PASSWORD`` is
+    # rejected outright (``option '--password' doesn't allow an
+    # argument``). The attached form ``-p<password>`` works in both.
     cmd = [bin_path, "x", "-y", "-o+"]
     cmd.append(f"-p{password}" if password else "-p-")
     cmd += [str(archive_path), str(dest_dir) + "/"]
