@@ -163,6 +163,7 @@ def test_extract_garbage_raises_with_clear_message(tmp_path: Path) -> None:
 # archive variant (RAR4 vs RAR5, header-encrypted .7z, etc.).
 # ---------------------------------------------------------------------------
 from pipeline.archive import (  # noqa: E402
+    _dest_has_files,
     _is_password_error,
     _is_retryable,
     _last_useful_line,
@@ -298,6 +299,41 @@ class TestLastUsefulLine:
     def test_skips_blank_and_bare_error_lines(self) -> None:
         blob = "\n\nERRORS\n\nthe real error\nFiles: 0\nCompressed: 0\n"
         assert _last_useful_line(blob) == "the real error"
+
+
+class TestDestHasFiles:
+    """`_dest_has_files` is the safety net that catches extractors
+    (notably ``unrar-free`` 0.0.2) which return rc=0 but produce no
+    files — without it, the bot would silently report success on a
+    corrupt RAR. See PR #31."""
+
+    def test_empty_dir_is_false(self, tmp_path: Path) -> None:
+        d = tmp_path / "empty"
+        d.mkdir()
+        assert _dest_has_files(d) is False
+
+    def test_dir_with_only_subdirs_is_false(self, tmp_path: Path) -> None:
+        # ``rglob('*')`` yields the directory entry too, but
+        # ``_dest_has_files`` must only return True for *regular files*.
+        d = tmp_path / "nested"
+        (d / "subdir" / "deeper").mkdir(parents=True)
+        assert _dest_has_files(d) is False
+
+    def test_dir_with_a_file_is_true(self, tmp_path: Path) -> None:
+        d = tmp_path / "ok"
+        d.mkdir()
+        (d / "cookies.txt").write_text("x", encoding="utf-8")
+        assert _dest_has_files(d) is True
+
+    def test_nested_file_is_true(self, tmp_path: Path) -> None:
+        d = tmp_path / "ok"
+        (d / "deep" / "path").mkdir(parents=True)
+        (d / "deep" / "path" / "cookies.txt").write_text("x", encoding="utf-8")
+        assert _dest_has_files(d) is True
+
+    def test_missing_dir_is_false(self, tmp_path: Path) -> None:
+        # Defensive: should not raise, just report "no files".
+        assert _dest_has_files(tmp_path / "does-not-exist") is False
 
 
 class TestExtractArchiveSurfacesPasswordErrors:
