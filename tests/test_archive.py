@@ -172,6 +172,7 @@ from pipeline.archive import (  # noqa: E402
     _last_useful_line,
     _run,
     _stderr_blob,
+    _wipe_dir_contents,
 )
 
 
@@ -498,6 +499,129 @@ class TestAllOnPathDedupe:
         monkeypatch.setenv("PATH", str(bin_dir))
         out = _all_on_path(["7z", "7za", "7zz"])
         assert len(out) == 3
+
+
+class TestWipeDirContents:
+    """``_wipe_dir_contents`` is the safety net that prevents the
+    silent-success bug where a previous extractor's leftovers (e.g.
+    ``7z`` 16.02's zero-byte placeholder files for entries it
+    couldn't decode) get misread as proof that the next extractor
+    succeeded."""
+
+    def test_removes_files(self, tmp_path: Path) -> None:
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        _wipe_dir_contents(tmp_path)
+        assert tmp_path.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_removes_zero_byte_placeholders(self, tmp_path: Path) -> None:
+        # Recreate exactly what 7z 16.02 leaves behind on
+        # ``ERROR: Unsupported Method`` against a RAR5 archive.
+        (tmp_path / "AcolyteBases.txt").write_bytes(b"")
+        (tmp_path / "@AcolyteBases - Telegram.jpg").write_bytes(b"")
+        _wipe_dir_contents(tmp_path)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_removes_nested_directories(self, tmp_path: Path) -> None:
+        nested = tmp_path / "sub" / "deep"
+        nested.mkdir(parents=True)
+        (nested / "leaf").write_text("y")
+        _wipe_dir_contents(tmp_path)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_keeps_dest_dir_itself(self, tmp_path: Path) -> None:
+        (tmp_path / "a").write_text("x")
+        _wipe_dir_contents(tmp_path)
+        # Directory itself MUST survive — extract_archive expects to
+        # invoke the next extractor right into it.
+        assert tmp_path.is_dir()
+
+    def test_no_op_on_already_empty_dir(self, tmp_path: Path) -> None:
+        _wipe_dir_contents(tmp_path)
+        assert tmp_path.is_dir()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_no_op_on_missing_dir(self, tmp_path: Path) -> None:
+        gone = tmp_path / "does-not-exist"
+        # MUST NOT raise — extract_archive is tolerant of races where
+        # dest_dir hasn't been created yet.
+        _wipe_dir_contents(gone)
+
+
+class TestExtractArchiveResetsDestBetweenAttempts:
+    """End-to-end-ish: stub out the extractor chain and prove that a
+    later candidate's ``rc=0`` does NOT count as success when only
+    leftovers from a *previous* failed candidate are on disk.
+
+    This is the exact failure mode that bit the user in the screenshot
+    bug: ``7z`` 16.02 leaves zero-byte placeholders for every RAR5
+    entry it can't decode, and ``unrar-free`` 0.0.2 then prints
+    "unknown archive type" + ``rc=0`` without writing anything. Without
+    the wipe between attempts, ``rc==0 and _dest_has_files`` would
+    return the leftover placeholders to the cookie parser and the bot
+    would silently report success on a broken extraction.
+    """
+
+    def test_seven_zip_placeholders_do_not_fool_later_unrar(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive = tmp_path / "input.rar"
+        # Real RAR5 magic so detect_archive_kind returns "rar".
+        archive.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+        dest = tmp_path / "out"
+
+        from pipeline import archive as A
+
+        # Pretend both 7z and unrar are on PATH, distinct binaries.
+        monkeypatch.setattr(
+            A,
+            "_all_on_path",
+            lambda cands: ["/fake/7z"] if "7z" in cands else ["/fake/unrar-free"],
+        )
+
+        calls: list[str] = []
+
+        def fake_stderr_blob(cmd: list[str], timeout: int) -> tuple[int, str]:
+            calls.append(Path(cmd[0]).name)
+            if Path(cmd[0]).name == "7z":
+                # Simulate 7z 16.02's behaviour exactly: leaves
+                # 0-byte placeholders for the entries it couldn't
+                # decode, exits rc=2 with "Unsupported Method".
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "AcolyteBases.txt").write_bytes(b"")
+                (dest / "@AcolyteBases - Telegram.jpg").write_bytes(b"")
+                return 2, "ERROR: Unsupported Method : AcolyteBases.txt\n"
+            # unrar-free returns rc=0 with "unknown archive type" and
+            # writes nothing.
+            return 0, (
+                "unknown archive type, only plain RAR 2.0 supported"
+                "(normal and solid archives), SFX and Volumes are NOT "
+                "supported!\nAll OK\n"
+            )
+
+        monkeypatch.setattr(A, "_stderr_blob", fake_stderr_blob)
+
+        with pytest.raises(A.ArchiveError) as exc:
+            A.extract_archive(archive, dest, password="@AcolyteBases", timeout=5)
+        msg = str(exc.value).lower()
+        # The whole point: we MUST NOT silently succeed.
+        # And the wipe MUST have removed the 0-byte placeholders
+        # before the unrar-free attempt, so they don't survive the
+        # whole chain either.
+        leftover = list(dest.rglob("*")) if dest.exists() else []
+        leftover_files = [p for p in leftover if p.is_file()]
+        assert leftover_files == [], (
+            f"placeholders should have been wiped, found: {leftover_files}"
+        )
+        # And the user-visible error MUST name the codec gap, not
+        # bare "All OK" or empty output.
+        assert "rar 2.0" in msg or "unsupported method" in msg, msg
+        # Both extractors must have actually been tried (proves we
+        # didn't short-circuit on the first one's leftovers).
+        assert calls == ["7z", "unrar-free"], calls
 
 
 class TestBuildUnrarCmd:

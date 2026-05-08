@@ -220,6 +220,32 @@ def _dest_has_files(dest_dir: Path) -> bool:
     return False
 
 
+def _wipe_dir_contents(dest_dir: Path) -> None:
+    """Remove every entry inside ``dest_dir`` while leaving the
+    directory itself in place.
+
+    Used between extractor attempts so a previous candidate's
+    leftovers can't be mistaken for the next candidate's success
+    (see ``extract_archive`` for the failure mode this guards
+    against).
+    """
+    try:
+        entries = list(dest_dir.iterdir())
+    except (OSError, FileNotFoundError):
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
+            elif entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            # Best-effort: a clean attempt is a nice-to-have; if
+            # something refuses to go we'll still surface the
+            # downstream error normally.
+            pass
+
+
 def _which_first(candidates: Sequence[str]) -> Optional[str]:
     found = _all_on_path(candidates)
     return found[0] if found else None
@@ -453,6 +479,20 @@ def extract_archive(
     last_blob = ""
     last_bin = ""
     for bin_path, cmd in candidates:
+        # Each extractor must start with a clean ``dest_dir``. Otherwise
+        # a previous attempt's leftovers would be misread as proof of
+        # success: ``7z`` 16.02 in particular creates **zero-byte
+        # placeholder** files for every entry it can't decode (the
+        # screenshot bug archive triggers this — RAR5 ⇒ ``ERROR:
+        # Unsupported Method``, but the empty ``AcolyteBases.txt`` and
+        # ``@AcolyteBases - Telegram.jpg`` placeholders survive the
+        # ``rc=2`` exit). With those still on disk, the next extractor
+        # in the chain (``unrar-free`` 0.0.2 here, which prints
+        # "unknown archive type" and returns rc=0 without writing
+        # anything) would trip the ``rc == 0 and _dest_has_files``
+        # branch and we would silently hand 0-byte files to the
+        # cookie parser.
+        _wipe_dir_contents(dest_dir)
         rc, blob = _stderr_blob(cmd, timeout)
         if rc == 0 and _dest_has_files(dest_dir):
             log.info(
@@ -509,10 +549,19 @@ def extract_archive(
     # Every candidate gave up with a "retryable" complaint. Surface
     # something actionable.
     tail = _last_useful_line(last_blob)
-    # ``unrar-free`` 0.0.2's "<num> Failed" tally is uniquely useless
-    # to a user on its own (it just says "485 Failed", not WHY) so we
-    # rewrite the leading diagnostic to name the codec gap explicitly.
-    if _UNRAR_FREE_FAILED_RE.search(last_blob):
+    # ``unrar-free`` 0.0.2 fails one of two ways on a RAR3+ archive:
+    # a "<num> Failed" tally (the literal "485 Failed" line in the
+    # screenshot bug) on a partially-readable header, OR an
+    # "unknown archive type, only plain RAR 2.0 supported" line +
+    # rc=0 + empty dest on a header it can't read at all. Both
+    # surfaced verbatim are useless to the user, so rewrite the
+    # leading diagnostic to name the codec gap explicitly. The
+    # bot's ``_friendly_pipeline_error`` keys off this exact phrase.
+    low = last_blob.lower()
+    if (
+        _UNRAR_FREE_FAILED_RE.search(last_blob)
+        or "only plain rar 2.0 supported" in low
+    ):
         tail = (
             "unrar-free can only read RAR 2.0 archives — this one "
             "uses a newer RAR3 / RAR4 / RAR5 codec it doesn't "
