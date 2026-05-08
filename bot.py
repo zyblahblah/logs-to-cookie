@@ -312,6 +312,23 @@ def _friendly_pipeline_error(exc: Exception) -> str:
             "💡 Install a newer `p7zip-full` and the proprietary "
             "`unrar` binary, then retry."
         )
+    # ``unrar-free`` 0.0.2 only understands RAR 2.0; on a RAR3+ archive
+    # it bails with "<num> Failed" or "unknown archive type, only plain
+    # RAR 2.0 supported". The pipeline rewrites that into a sentence
+    # the bot can match here so the user gets actionable advice
+    # instead of a cryptic "extraction failed: 485 Failed".
+    if (
+        "unrar-free can only read rar 2.0" in low
+        or "only plain rar 2.0 supported" in low
+    ):
+        return (
+            "❌ This server's RAR reader (`unrar-free`) only handles "
+            "ancient RAR 2.0 archives — yours uses RAR3 / RAR4 / "
+            "RAR5.\n"
+            "💡 Install the proprietary `unrar` binary or the "
+            "`p7zip-rar` codec (Debian/Ubuntu *multiverse*), or "
+            "repackage the logs as `.zip` / `.7z` and retry."
+        )
     if "archive is encrypted but no password was supplied" in low:
         return (
             "❌ This archive is encrypted but you sent /skip at the "

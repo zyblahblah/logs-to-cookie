@@ -16,6 +16,8 @@ falling back to the suffix.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -71,6 +73,37 @@ _RETRYABLE_ERROR_FRAGMENTS: tuple[str, ...] = (
     "can not open as archive",
     "can't open as archive",
     "is not archive",
+    # ``unrar-free`` 0.0.2 (the GPL fork shipped on Debian/Ubuntu main,
+    # often the only RAR reader on Railway / locked-down PaaS hosts)
+    # bails on RAR3+ archives with this exact phrase. The codec set
+    # is tiny — basically RAR2.0 only — so anything fancier should
+    # fall through to bsdtar / libarchive.
+    "unknown archive type",
+    "only plain rar 2.0 supported",
+    # ``bsdtar`` (libarchive) on a RAR5 archive whose codec it
+    # doesn't fully support emits something like:
+    #     <name>: Unsupported block header size (was 5, max is 2):
+    #         No such file or directory
+    #     bsdtar: Error exit delayed from previous errors.
+    # This is the LAST extractor in the chain, so without flagging
+    # the failure as retryable the bot raises libarchive's noisy
+    # tail verbatim and the codec-gap rewrite (which gives the user
+    # actionable advice) never fires. Both phrases below are stable
+    # libarchive messages.
+    "unsupported block header size",
+    "error exit delayed",
+)
+
+
+# ``unrar-free`` 0.0.2 reports a per-archive entry tally on a partial
+# failure (e.g. a RAR3 archive whose HEADER reads OK but whose entry
+# codec is unsupported): a bare line of the form "<num> Failed".
+# Without routing this through ``_is_retryable`` the bot would
+# surface "extraction failed: 485 Failed" verbatim to the user — the
+# exact screenshot in the bug report. Anchoring to a leading integer
+# avoids over-matching generic "asprintf failed: ..." style errors.
+_UNRAR_FREE_FAILED_RE = re.compile(
+    r"(?mi)^\s*\d+\s+Failed\s*$"
 )
 
 # Substrings that mean "this archive needs a (different) password".
@@ -154,14 +187,33 @@ def detect_archive_kind(path: Path) -> Optional[str]:
 
 
 def _all_on_path(candidates: Sequence[str]) -> List[str]:
-    """Return every candidate that resolves to a real binary, in order."""
+    """Return every candidate that resolves to a real binary, in order.
+
+    Dedupes by both the on-PATH lookup (so the same alias isn't run
+    twice) AND by the resolved physical path. On Debian/Ubuntu
+    ``unrar`` is provided by the ``unrar-free`` package via
+    update-alternatives — ``/usr/bin/unrar`` is just a symlink pointing
+    at ``/usr/bin/unrar-free``. Without the realpath dedupe the bot
+    would call ``unrar-free`` twice in a row (once as ``unrar``, once
+    as ``unrar-free``) before falling through to ``bsdtar``, which
+    just doubles the failure log.
+    """
     out: List[str] = []
-    seen: set[str] = set()
+    seen_path: set[str] = set()
+    seen_real: set[str] = set()
     for c in candidates:
         path = shutil.which(c)
-        if path and path not in seen:
-            seen.add(path)
-            out.append(path)
+        if not path or path in seen_path:
+            continue
+        seen_path.add(path)
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        out.append(path)
     return out
 
 
@@ -178,6 +230,32 @@ def _dest_has_files(dest_dir: Path) -> bool:
     except OSError:
         pass
     return False
+
+
+def _wipe_dir_contents(dest_dir: Path) -> None:
+    """Remove every entry inside ``dest_dir`` while leaving the
+    directory itself in place.
+
+    Used between extractor attempts so a previous candidate's
+    leftovers can't be mistaken for the next candidate's success
+    (see ``extract_archive`` for the failure mode this guards
+    against).
+    """
+    try:
+        entries = list(dest_dir.iterdir())
+    except (OSError, FileNotFoundError):
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
+            elif entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            # Best-effort: a clean attempt is a nice-to-have; if
+            # something refuses to go we'll still surface the
+            # downstream error normally.
+            pass
 
 
 def _which_first(candidates: Sequence[str]) -> Optional[str]:
@@ -216,14 +294,14 @@ def _build_unrar_cmd(
         if password:
             cmd += ["--passphrase", password]
         return cmd
-    if name == "unrar-free":
-        # unrar-free uses a GNU-ish CLI: ``-x`` to extract.
-        cmd = [bin_path, "-x"]
-        if password:
-            cmd += ["-p", password]
-        cmd += [str(archive_path), str(dest_dir) + "/"]
-        return cmd
-    # Proprietary unrar (and most CLI clones).
+    # Both proprietary ``unrar`` and the GPL ``unrar-free`` fork accept
+    # the proprietary-style command line (``compat_parse_opts`` in the
+    # fork). We MUST use that — unrar-free's native argp parser
+    # treats ``-p`` as a no-arg toggle that just enables interactive
+    # password prompting, so ``-p PASSWORD`` would hang at
+    # ``Password:`` waiting on stdin and ``--password=PASSWORD`` is
+    # rejected outright (``option '--password' doesn't allow an
+    # argument``). The attached form ``-p<password>`` works in both.
     cmd = [bin_path, "x", "-y", "-o+"]
     cmd.append(f"-p{password}" if password else "-p-")
     cmd += [str(archive_path), str(dest_dir) + "/"]
@@ -302,6 +380,12 @@ def _is_retryable(stderr_blob: str) -> bool:
         # A wrong-password failure is never "retryable" — the next
         # extractor will hit the same wall. Surface it as-is.
         return False
+    if _UNRAR_FREE_FAILED_RE.search(stderr_blob):
+        # ``unrar-free`` 0.0.2 finishes with "<num> Failed" on a RAR3+
+        # archive whose header it CAN read but whose entry codec it
+        # can't. Retry with libarchive (``bsdtar``) which handles
+        # RAR4/RAR5 in many of these cases.
+        return True
     return any(frag in low for frag in _RETRYABLE_ERROR_FRAGMENTS)
 
 
@@ -406,7 +490,28 @@ def extract_archive(
 
     last_blob = ""
     last_bin = ""
+    # ``all_blobs`` accumulates every extractor's diagnostic across the
+    # whole chain. Without it the codec-gap rewrite below would only
+    # see the LAST extractor's output (e.g. ``bsdtar``'s noisy
+    # "Error exit delayed from previous errors") and we'd miss the
+    # earlier, more diagnostic ``unrar-free`` "only plain RAR 2.0"
+    # / ``<num> Failed`` line that names the actual problem.
+    all_blobs: List[str] = []
     for bin_path, cmd in candidates:
+        # Each extractor must start with a clean ``dest_dir``. Otherwise
+        # a previous attempt's leftovers would be misread as proof of
+        # success: ``7z`` 16.02 in particular creates **zero-byte
+        # placeholder** files for every entry it can't decode (the
+        # screenshot bug archive triggers this — RAR5 ⇒ ``ERROR:
+        # Unsupported Method``, but the empty ``AcolyteBases.txt`` and
+        # ``@AcolyteBases - Telegram.jpg`` placeholders survive the
+        # ``rc=2`` exit). With those still on disk, the next extractor
+        # in the chain (``unrar-free`` 0.0.2 here, which prints
+        # "unknown archive type" and returns rc=0 without writing
+        # anything) would trip the ``rc == 0 and _dest_has_files``
+        # branch and we would silently hand 0-byte files to the
+        # cookie parser.
+        _wipe_dir_contents(dest_dir)
         rc, blob = _stderr_blob(cmd, timeout)
         if rc == 0 and _dest_has_files(dest_dir):
             log.info(
@@ -432,9 +537,11 @@ def extract_archive(
             )
             last_blob = blob
             last_bin = bin_path
+            all_blobs.append(blob)
             continue
         last_blob = blob
         last_bin = bin_path
+        all_blobs.append(blob)
         retryable = _is_retryable(blob)
         log.info(
             "extractor %s rc=%d, retryable=%s",
@@ -463,6 +570,29 @@ def extract_archive(
     # Every candidate gave up with a "retryable" complaint. Surface
     # something actionable.
     tail = _last_useful_line(last_blob)
+    # ``unrar-free`` 0.0.2 fails one of two ways on a RAR3+ archive:
+    # a "<num> Failed" tally (the literal "485 Failed" line in the
+    # screenshot bug) on a partially-readable header, OR an
+    # "unknown archive type, only plain RAR 2.0 supported" line +
+    # rc=0 + empty dest on a header it can't read at all. Both
+    # surfaced verbatim are useless to the user, so rewrite the
+    # leading diagnostic to name the codec gap explicitly. The
+    # bot's ``_friendly_pipeline_error`` keys off this exact phrase.
+    # Scan ``all_blobs`` (not just ``last_blob``) so the rewrite
+    # still fires when bsdtar's libarchive noise is the LAST blob
+    # but unrar-free's codec-gap signal showed up earlier.
+    aggregated = "\n".join(all_blobs)
+    low_agg = aggregated.lower()
+    if (
+        _UNRAR_FREE_FAILED_RE.search(aggregated)
+        or "only plain rar 2.0 supported" in low_agg
+        or "unknown archive type" in low_agg
+    ):
+        tail = (
+            "unrar-free can only read RAR 2.0 archives — this one "
+            "uses a newer RAR3 / RAR4 / RAR5 codec it doesn't "
+            "understand"
+        )
     extra = ""
     if kind == "rar" and not unrars:
         extra = (
