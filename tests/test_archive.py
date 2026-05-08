@@ -163,6 +163,7 @@ def test_extract_garbage_raises_with_clear_message(tmp_path: Path) -> None:
 # archive variant (RAR4 vs RAR5, header-encrypted .7z, etc.).
 # ---------------------------------------------------------------------------
 from pipeline.archive import (  # noqa: E402
+    _all_on_path,
     _decode_subproc_bytes,
     _dest_has_files,
     _is_password_error,
@@ -171,6 +172,36 @@ from pipeline.archive import (  # noqa: E402
     _run,
     _stderr_blob,
 )
+
+
+# Real ``unrar-free`` 0.0.2 stderr/stdout blob for a RAR4 archive
+# (``rar a -m0 ...``) that the GPL fork can't actually decode. The
+# tally line at the bottom is THE distinguishing feature — without
+# it, the bot would happily report "extraction failed: 485 Failed"
+# verbatim to the user.
+UNRAR_FREE_FAILED_BLOB = """\
+UNRAR-free 0.0.2
+
+Extracting from input.rar
+
+Extracting  src/cookies.txt                                            FAILED
+Extracting  src/passwords.txt                                          FAILED
+Extracting  src/forms.txt                                              FAILED
+2 Failed
+"""
+
+# Real ``unrar-free`` blob for a RAR3+ archive that the fork
+# rejects at the header level (it can't even start enumerating
+# entries). Different code path, same effective failure.
+UNRAR_FREE_UNKNOWN_TYPE_BLOB = """\
+UNRAR-free 0.0.2
+
+Extracting from input.rar
+
+unknown archive type, only plain RAR 2.0 supported(normal compression),
+SFXes, Volumes, Encryption and Comments are not supported either
+All OK
+"""
 
 
 # Real p7zip 16.02 stderr captured locally. Reproduces the exact
@@ -247,6 +278,27 @@ class TestIsRetryable:
 
     def test_clean_run_is_not_retryable(self) -> None:
         assert _is_retryable("Everything is Ok\n") is False
+
+    def test_unrar_free_failed_tally_is_retryable(self) -> None:
+        # Reproduces the exact bug from the screenshot: unrar-free
+        # 0.0.2 finishes a RAR4 archive with "<num> Failed". Without
+        # this routing the bot raises immediately instead of falling
+        # through to ``bsdtar`` (which CAN read RAR4/RAR5).
+        assert _is_retryable(UNRAR_FREE_FAILED_BLOB) is True
+        assert _is_retryable("485 Failed\n") is True
+        assert _is_retryable("  1 Failed\n") is True
+
+    def test_unrar_free_unknown_archive_type_is_retryable(self) -> None:
+        # A RAR3+ archive whose header unrar-free can't even parse
+        # — must fall through to the next extractor in the chain.
+        assert _is_retryable(UNRAR_FREE_UNKNOWN_TYPE_BLOB) is True
+
+    def test_bare_failed_word_is_NOT_retryable(self) -> None:
+        # The "<num> Failed" pattern is anchored to a number — a
+        # generic "asprintf failed: out of memory" must NOT match,
+        # otherwise we'd retry every malloc failure forever.
+        assert _is_retryable("asprintf failed: out of memory") is False
+        assert _is_retryable("operation failed unexpectedly\n") is False
 
 
 class TestIsPasswordError:
@@ -403,6 +455,114 @@ class TestSubprocByteToleration:
         assert rc == 0
         assert "Extracting" in blob
         assert "invalid_filename.txt" in blob
+
+
+class TestAllOnPathDedupe:
+    """``_all_on_path`` must dedupe by realpath, not just by the
+    on-PATH lookup. Debian/Ubuntu's ``unrar`` package is provided by
+    ``unrar-free`` via update-alternatives, so ``which unrar`` and
+    ``which unrar-free`` resolve to the same physical binary. Running
+    it twice in a row just doubles the failure log."""
+
+    def test_dedupes_symlinked_binaries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        # The "real" binary.
+        real = bin_dir / "unrar-free"
+        real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        real.chmod(0o755)
+        # An update-alternatives-style symlink.
+        link = bin_dir / "unrar"
+        link.symlink_to(real)
+
+        monkeypatch.setenv("PATH", str(bin_dir))
+        out = _all_on_path(["unrar", "unrar-free"])
+        # Either of the two paths is acceptable; what matters is that
+        # we get exactly ONE entry, not two.
+        assert len(out) == 1
+        assert Path(out[0]).name in {"unrar", "unrar-free"}
+
+    def test_keeps_distinct_binaries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for name in ("7z", "7za", "7zz"):
+            p = bin_dir / name
+            p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            p.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(bin_dir))
+        out = _all_on_path(["7z", "7za", "7zz"])
+        assert len(out) == 3
+
+
+class TestExtractArchiveSurfacesUnrarFreeFailure:
+    """Make sure ``extract_archive`` rewrites the cryptic
+    "<num> Failed" tally into something a user can act on, instead
+    of the screenshot's ``❌ Error: extraction failed: 485 Failed``."""
+
+    def test_rewrites_failed_tally_into_codec_advice(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Plant a pretend RAR file (just the magic bytes) and stub
+        # ``_all_on_path`` to report a single fake "unrar" candidate
+        # whose stderr matches unrar-free's "<num> Failed" pattern.
+        archive = tmp_path / "input.rar"
+        archive.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 64)
+
+        from pipeline import archive as archive_mod
+
+        def fake_all_on_path(candidates: list[str]) -> list[str]:
+            if "7z" in candidates:
+                return []
+            if "unrar-free" in candidates or "unrar" in candidates:
+                return ["/usr/bin/unrar-free"]
+            return []
+
+        def fake_stderr_blob(
+            cmd: list[str], timeout: int
+        ) -> tuple[int, str]:
+            return 1, UNRAR_FREE_FAILED_BLOB
+
+        monkeypatch.setattr(archive_mod, "_all_on_path", fake_all_on_path)
+        monkeypatch.setattr(archive_mod, "_stderr_blob", fake_stderr_blob)
+
+        out = tmp_path / "out"
+        with pytest.raises(ArchiveError) as exc:
+            extract_archive(archive, out, password=None)
+        msg = str(exc.value).lower()
+        # The user must NOT see the raw "485 Failed" tally —
+        # that's what triggered the bug report.
+        assert "failed" not in msg.split(":")[-1].split()[:2]
+        # The friendly message names the underlying codec gap.
+        assert "rar 2.0" in msg
+        assert "rar3" in msg or "rar4" in msg or "rar5" in msg
+
+
+class TestFriendlyPipelineErrorForUnrarFree:
+    """The bot's user-facing translator must catch the rewritten
+    unrar-free message and turn it into actionable installation
+    advice, not pass through the raw exception text."""
+
+    def test_unrar_free_message_translates_to_install_advice(self) -> None:
+        from bot import _friendly_pipeline_error
+
+        raw = (
+            "extraction failed via unrar-free: unrar-free can only "
+            "read RAR 2.0 archives — this one uses a newer RAR3 / "
+            "RAR4 / RAR5 codec it doesn't understand"
+        )
+        out = _friendly_pipeline_error(raw)
+        low = out.lower()
+        assert "rar 2.0" in low
+        # Must surface installation advice, not the raw "Failed" tally.
+        assert "unrar" in low
+        assert "485 failed" not in low
 
 
 class TestExtractArchiveSurfacesPasswordErrors:

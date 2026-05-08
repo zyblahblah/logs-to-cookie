@@ -16,6 +16,8 @@ falling back to the suffix.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -71,6 +73,25 @@ _RETRYABLE_ERROR_FRAGMENTS: tuple[str, ...] = (
     "can not open as archive",
     "can't open as archive",
     "is not archive",
+    # ``unrar-free`` 0.0.2 (the GPL fork shipped on Debian/Ubuntu main,
+    # often the only RAR reader on Railway / locked-down PaaS hosts)
+    # bails on RAR3+ archives with this exact phrase. The codec set
+    # is tiny — basically RAR2.0 only — so anything fancier should
+    # fall through to bsdtar / libarchive.
+    "unknown archive type",
+    "only plain rar 2.0 supported",
+)
+
+
+# ``unrar-free`` 0.0.2 reports a per-archive entry tally on a partial
+# failure (e.g. a RAR3 archive whose HEADER reads OK but whose entry
+# codec is unsupported): a bare line of the form "<num> Failed".
+# Without routing this through ``_is_retryable`` the bot would
+# surface "extraction failed: 485 Failed" verbatim to the user — the
+# exact screenshot in the bug report. Anchoring to a leading integer
+# avoids over-matching generic "asprintf failed: ..." style errors.
+_UNRAR_FREE_FAILED_RE = re.compile(
+    r"(?mi)^\s*\d+\s+Failed\s*$"
 )
 
 # Substrings that mean "this archive needs a (different) password".
@@ -154,14 +175,33 @@ def detect_archive_kind(path: Path) -> Optional[str]:
 
 
 def _all_on_path(candidates: Sequence[str]) -> List[str]:
-    """Return every candidate that resolves to a real binary, in order."""
+    """Return every candidate that resolves to a real binary, in order.
+
+    Dedupes by both the on-PATH lookup (so the same alias isn't run
+    twice) AND by the resolved physical path. On Debian/Ubuntu
+    ``unrar`` is provided by the ``unrar-free`` package via
+    update-alternatives — ``/usr/bin/unrar`` is just a symlink pointing
+    at ``/usr/bin/unrar-free``. Without the realpath dedupe the bot
+    would call ``unrar-free`` twice in a row (once as ``unrar``, once
+    as ``unrar-free``) before falling through to ``bsdtar``, which
+    just doubles the failure log.
+    """
     out: List[str] = []
-    seen: set[str] = set()
+    seen_path: set[str] = set()
+    seen_real: set[str] = set()
     for c in candidates:
         path = shutil.which(c)
-        if path and path not in seen:
-            seen.add(path)
-            out.append(path)
+        if not path or path in seen_path:
+            continue
+        seen_path.add(path)
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        out.append(path)
     return out
 
 
@@ -302,7 +342,23 @@ def _is_retryable(stderr_blob: str) -> bool:
         # A wrong-password failure is never "retryable" — the next
         # extractor will hit the same wall. Surface it as-is.
         return False
-    return any(frag in low for frag in _RETRYABLE_ERROR_FRAGMENTS)
+    if _UNRAR_FREE_FAILED_RE.search(stderr_blob):
+        # ``unrar-free`` 0.0.2 finishes with "<num> Failed" on a RAR3+
+        # archive whose header it CAN read but whose entry codec it
+        # can't. Retry with libarchive (``bsdtar``) which handles
+        # RAR4/RAR5 in many of these cases.
+        return True
+    if any(frag in low for frag in _RETRYABLE_ERROR_FRAGMENTS):
+        # The placeholder " failed" fragment listed above would
+        # over-match (e.g. "asprintf failed: ..."), so route the
+        # actual " <num> Failed" check through the regex above and
+        # ignore it here.
+        return any(
+            frag in low
+            for frag in _RETRYABLE_ERROR_FRAGMENTS
+            if frag != " failed"
+        )
+    return False
 
 
 def _is_password_error(stderr_blob: str) -> bool:
@@ -463,6 +519,15 @@ def extract_archive(
     # Every candidate gave up with a "retryable" complaint. Surface
     # something actionable.
     tail = _last_useful_line(last_blob)
+    # ``unrar-free`` 0.0.2's "<num> Failed" tally is uniquely useless
+    # to a user on its own (it just says "485 Failed", not WHY) so we
+    # rewrite the leading diagnostic to name the codec gap explicitly.
+    if _UNRAR_FREE_FAILED_RE.search(last_blob):
+        tail = (
+            "unrar-free can only read RAR 2.0 archives — this one "
+            "uses a newer RAR3 / RAR4 / RAR5 codec it doesn't "
+            "understand"
+        )
     extra = ""
     if kind == "rar" and not unrars:
         extra = (
