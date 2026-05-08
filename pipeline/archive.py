@@ -44,19 +44,70 @@ MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
 # better for "Unsupported Method" failures because the codec set
 # tends to grow over time.
 SEVENZIP_BINARIES: tuple[str, ...] = ("7zz", "7z", "7za")
-UNRAR_BINARIES: tuple[str, ...] = ("unrar",)
+# RAR-specific extractors. ``unrar`` is the proprietary binary;
+# ``unrar-free`` is the GPLv2 fork shipped in Debian/Ubuntu main
+# (handles RAR4 / older RAR5 archives). ``bsdtar`` (libarchive) can
+# also crack RAR4 and RAR5 in many cases and is widely preinstalled.
+UNRAR_BINARIES: tuple[str, ...] = ("unrar", "unrar-free", "bsdtar")
 
 # Substrings that mean "this binary refused / can't handle this
 # archive — try the next candidate". We match on lowercase stderr so
 # we don't accidentally swallow real failures (e.g. wrong password).
+#
+# p7zip phrasing varies between 7-Zip versions and the GNU port:
+#   * 7-Zip / 7zz → "Cannot open the file as archive"
+#   * p7zip 16.02 (Ubuntu/Debian default) → "Can not open the file as
+#     archive" (note the SPACE in "Can not") and a footer line
+#     "Can't open as archive: 1". Both phrasings need to match here
+#     or the bot ends up reporting the useless "Compressed: 0"
+#     summary line as the failure reason.
 _RETRYABLE_ERROR_FRAGMENTS: tuple[str, ...] = (
     "unsupported method",
     "unsupported compression method",
     "unsupported feature",
     "cannot open the file as archive",
+    "can not open the file as archive",
     "cannot open as archive",
-    "headers error",
+    "can not open as archive",
+    "can't open as archive",
     "is not archive",
+)
+
+# Substrings that mean "this archive needs a (different) password".
+# These are NOT retryable — trying the next extractor will only
+# reproduce the same failure. We surface a friendly "wrong / missing
+# password" message instead.
+_PASSWORD_ERROR_FRAGMENTS: tuple[str, ...] = (
+    "wrong password",
+    "can not open encrypted archive",
+    "cannot open encrypted archive",
+    "the password is incorrect",
+    "encrypted file. corrupt file or wrong password",
+    "headers error",
+)
+
+# Footer lines emitted by p7zip / 7-Zip after the real error, e.g.
+#   ERROR: foo.rar
+#   Can not open the file as archive
+#
+#   Can't open as archive: 1
+#   Files: 0
+#   Size:       0
+#   Compressed: 0
+#
+# We strip these out of "last useful line" detection so the user
+# sees the real failure ("Can not open the file as archive") instead
+# of a meaningless "Compressed: 0".
+_NOISE_LINE_PREFIXES: tuple[str, ...] = (
+    "files:",
+    "size:",
+    "compressed:",
+    "can't open as archive:",
+    "archives with errors:",
+    "sub items errors:",
+    "errors:",
+    "warnings:",
+    "open errors:",
 )
 
 
@@ -143,6 +194,21 @@ def _build_unrar_cmd(
     dest_dir: Path,
     password: Optional[str],
 ) -> List[str]:
+    name = Path(bin_path).name.lower()
+    if name == "bsdtar":
+        # libarchive's tar can extract RAR4 / RAR5 with --passphrase.
+        cmd = [bin_path, "-x", "-f", str(archive_path), "-C", str(dest_dir)]
+        if password:
+            cmd += ["--passphrase", password]
+        return cmd
+    if name == "unrar-free":
+        # unrar-free uses a GNU-ish CLI: ``-x`` to extract.
+        cmd = [bin_path, "-x"]
+        if password:
+            cmd += ["-p", password]
+        cmd += [str(archive_path), str(dest_dir) + "/"]
+        return cmd
+    # Proprietary unrar (and most CLI clones).
     cmd = [bin_path, "x", "-y", "-o+"]
     cmd.append(f"-p{password}" if password else "-p-")
     cmd += [str(archive_path), str(dest_dir) + "/"]
@@ -195,14 +261,52 @@ def _stderr_blob(cmd: List[str], timeout: int) -> Tuple[int, str]:
 
 def _is_retryable(stderr_blob: str) -> bool:
     low = stderr_blob.lower()
+    if any(frag in low for frag in _PASSWORD_ERROR_FRAGMENTS):
+        # A wrong-password failure is never "retryable" — the next
+        # extractor will hit the same wall. Surface it as-is.
+        return False
     return any(frag in low for frag in _RETRYABLE_ERROR_FRAGMENTS)
 
 
+def _is_password_error(stderr_blob: str) -> bool:
+    low = stderr_blob.lower()
+    return any(frag in low for frag in _PASSWORD_ERROR_FRAGMENTS)
+
+
 def _last_useful_line(blob: str) -> str:
+    """Return the last non-empty diagnostic line from a 7z/unrar blob.
+
+    7z and p7zip both end their output with a summary footer (``Files:
+    0``, ``Size: 0``, ``Compressed: 0``, ``Can't open as archive: 1``,
+    ``Archives with Errors: 1``, etc.) that says nothing about *why*
+    extraction failed. We skip those noise lines and return the last
+    line that actually tells the user something — typically the
+    ``Can not open the file as archive`` / ``Wrong password?`` line
+    immediately above the footer.
+    """
+    candidates: List[str] = []
+    for line in blob.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if any(low.startswith(p) for p in _NOISE_LINE_PREFIXES):
+            continue
+        # Bare ``ERROR: <archive>`` / ``ERROR:`` lines on their own
+        # don't help — the line *underneath* them carries the real
+        # message. Skip them unless they contain an explanation.
+        if low == "errors" or low == "error:" or low == "warnings":
+            continue
+        if low.startswith("error:") and ":" in s and len(s.split(":", 1)[1].strip()) <= 1:
+            continue
+        candidates.append(s)
+    if candidates:
+        return candidates[-1]
+    # Fall back to the previous behaviour if every line is noise.
     for line in reversed(blob.splitlines()):
-        line = line.strip()
-        if line:
-            return line
+        s = line.strip()
+        if s:
+            return s
     return "extraction failed"
 
 
@@ -275,15 +379,28 @@ def extract_archive(
             return dest_dir
         last_blob = blob
         last_bin = bin_path
+        retryable = _is_retryable(blob)
         log.info(
             "extractor %s rc=%d, retryable=%s",
             Path(bin_path).name,
             rc,
-            _is_retryable(blob),
+            retryable,
         )
-        if not _is_retryable(blob):
-            # Real failure (bad password, corrupt archive, etc.) — no
-            # point trying every other extractor.
+        if _is_password_error(blob):
+            # Wrong / missing password is decisive: no other extractor
+            # will get any further. Surface a friendly message that
+            # the bot's user-facing layer can match on.
+            if password:
+                raise ArchiveError(
+                    "extraction failed: wrong password for archive"
+                )
+            raise ArchiveError(
+                "extraction failed: archive is encrypted but no "
+                "password was supplied"
+            )
+        if not retryable:
+            # Real failure (corrupt archive, etc.) — no point trying
+            # every other extractor.
             tail = _last_useful_line(blob)
             raise ArchiveError(f"extraction failed: {tail}")
 
@@ -293,8 +410,15 @@ def extract_archive(
     extra = ""
     if kind == "rar" and not unrars:
         extra = (
-            " — try installing the proprietary `unrar` binary; "
-            "p7zip can't always read the newest RAR5 codecs."
+            " — install the `p7zip-rar` codec or the `unrar` / "
+            "`unrar-free` binary; p7zip-full alone can't read .rar "
+            "on Debian/Ubuntu."
+        )
+    elif kind == "rar":
+        extra = (
+            " — try a newer extractor (proprietary `unrar`, the "
+            "`p7zip-rar` codec, or the official 7-Zip `7zz` build); "
+            "the installed extractor doesn't understand this RAR."
         )
     elif kind == "7z":
         extra = (

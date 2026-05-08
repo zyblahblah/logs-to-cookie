@@ -312,10 +312,36 @@ def _friendly_pipeline_error(exc: Exception) -> str:
             "💡 Install a newer `p7zip-full` and the proprietary "
             "`unrar` binary, then retry."
         )
-    if "wrong password" in low or "data error" in low and "encrypted" in low:
+    if "archive is encrypted but no password was supplied" in low:
         return (
-            "❌ Extraction failed — looks like the password is wrong "
-            "for at least one archive. Re-run /start and double-check."
+            "❌ This archive is encrypted but you sent /skip at the "
+            "password prompt. Re-run /start and supply the password "
+            "(or paste it inline as `url|password`)."
+        )
+    if "wrong password" in low or ("data error" in low and "encrypted" in low):
+        return (
+            "❌ Extraction failed — the password looks wrong for at "
+            "least one archive. Re-run /start and double-check it."
+        )
+    if (
+        "p7zip-full alone can't read .rar" in msg
+        or ("p7zip-rar" in low and "rar" in low)
+        or ("install" in low and "unrar" in low and "rar" in low)
+    ):
+        return (
+            "❌ This server can't read .rar archives — `p7zip-full` "
+            "on Debian/Ubuntu doesn't ship the RAR codec.\n"
+            "💡 Install `p7zip-rar` (Debian/Ubuntu multiverse) or "
+            "the proprietary `unrar` binary, or repackage the logs "
+            "as .zip / .7z and retry."
+        )
+    if "can not open the file as archive" in low or "can't open as archive" in low:
+        return (
+            "❌ Extraction failed — the file the bot downloaded "
+            "isn't a recognisable archive (or the installed "
+            "extractor can't read this variant).\n"
+            "💡 Double-check the link points at a real archive and "
+            "that the host hasn't returned an HTML error page."
         )
     return f"❌ Error: {msg}"
 

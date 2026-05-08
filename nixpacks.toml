@@ -1,5 +1,9 @@
 # Railway / Nixpacks build configuration.
-# p7zip handles encrypted .zip, .7z, and (via its own RAR codec) .rar
-# archives — ``unrar`` is no longer required.
+# p7zip on Debian/Ubuntu does NOT include the RAR codec on its own
+# (the codec lives in the separate non-free ``p7zip-rar`` package),
+# so we install ``unrar`` explicitly for .rar archives. ``libarchive``
+# (``bsdtar``) is a third extractor the bot will fall back to for
+# RAR4 / RAR5 if neither ``unrar`` nor the p7zip RAR codec are
+# available.
 [phases.setup]
-nixPkgs = ["p7zip"]
+nixPkgs = ["p7zip", "unrar", "libarchive"]
