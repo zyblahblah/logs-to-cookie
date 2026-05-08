@@ -6,7 +6,8 @@
         "mkdir -p bin",
         "curl -fsSL https://www.7-zip.org/a/7z2601-linux-x64.tar.xz | tar -xJ -C bin 7zz",
         "chmod +x bin/7zz"
-      ]
+      ],
+      "deployOutputs": ["bin"]
     }
   },
   "deploy": {
