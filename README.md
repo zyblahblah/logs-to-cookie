@@ -114,11 +114,12 @@ the bot more codecs to fall back on for stubborn RAR archives.
 2. Open *Variables* and set:
    - `BOT_TOKEN` — token from [@BotFather](https://t.me/BotFather)
    - `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended).
-3. Deploy. Railway runs `worker: PATH="/app/bin:$PATH" python bot.py` (see `Procfile`). `railpack.json` does two things in the build image:
-   - downloads the official upstream **7-Zip `7zz`** binary into `/app/bin/7zz` (handles RAR4/RAR5 natively, no `multiverse` apt feed needed);
-   - installs `p7zip-full`, `unrar-free`, and `libarchive-tools` via apt as belt-and-braces fallbacks.
+3. Deploy. `railpack.json` does three things:
+   - downloads the official upstream **7-Zip `7zz`** binary into `/app/bin/7zz` in the build image (handles RAR4/RAR5 natively, no `multiverse` apt feed needed);
+   - installs `p7zip-full`, `unrar-free`, and `libarchive-tools` via apt as belt-and-braces fallbacks;
+   - sets `deploy.startCommand` to `PATH="/app/bin:$PATH" python bot.py` so the bundled `7zz` is the first extractor the bot's chain finds (it's already preferred over `7z` / `7za`).
 
-   The Procfile prepends `/app/bin` to `$PATH` so the bot's extractor chain finds `7zz` first (it's already preferred over `7z` / `7za`). `nixpacks.toml` is kept around for older Railway services / self-hosters that build with Nixpacks.
+   The same `PATH=` prefix is mirrored in `Procfile` for non-Railpack hosts. `nixpacks.toml` is kept around for older Railway services / self-hosters that build with Nixpacks.
 
 > **Heads up — Railway uses Railpack, not Nixpacks, by default since
 > mid-2025.** That's why an earlier version of this README (which only

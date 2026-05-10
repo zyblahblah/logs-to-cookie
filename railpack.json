@@ -3,14 +3,18 @@
   "steps": {
     "install-7zz": {
       "commands": [
+        "set -eux",
         "mkdir -p bin",
         "curl -fsSL https://www.7-zip.org/a/7z2601-linux-x64.tar.xz | tar -xJ -C bin 7zz",
-        "chmod +x bin/7zz"
+        "chmod +x bin/7zz",
+        "ls -la bin/",
+        "./bin/7zz | head -2"
       ],
       "deployOutputs": [{ "include": ["bin"] }]
     }
   },
   "deploy": {
+    "startCommand": "PATH=\"/app/bin:$PATH\" python bot.py",
     "aptPackages": [
       "p7zip-full",
       "unrar-free",

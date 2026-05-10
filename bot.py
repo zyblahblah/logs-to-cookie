@@ -62,7 +62,7 @@ from telegram.ext import (
 )
 
 from pipeline import AccessStore, Job, JobQueue, run_pipeline_multi
-from pipeline.archive import SEVENZIP_BINARIES, UNRAR_BINARIES
+from pipeline.archive import SEVENZIP_BINARIES, UNRAR_BINARIES, _all_on_path
 
 load_dotenv()
 
@@ -1080,17 +1080,12 @@ def build_app() -> Application:
 
 
 def _check_extractor_binaries() -> None:
-    """Warn loudly at startup if the archive extractor isn't on PATH."""
+    """Log every extractor on PATH at startup, plus diagnostics for
+    deploys where ``/app/bin/7zz`` was bundled but not picked up."""
+    log.info("PATH=%s", os.environ.get("PATH", ""))
 
-    def _first_on_path(candidates: Sequence[str]) -> Optional[str]:
-        for c in candidates:
-            p = shutil.which(c)
-            if p:
-                return p
-        return None
-
-    sevenzip = _first_on_path(SEVENZIP_BINARIES)
-    if sevenzip is None:
+    sevenzips = _all_on_path(SEVENZIP_BINARIES)
+    if not sevenzips:
         log.warning(
             "7z binary not found on PATH (looked for %s). "
             "All archive extraction (zip / 7z / rar) will fail at "
@@ -1099,17 +1094,37 @@ def _check_extractor_binaries() -> None:
             ", ".join(SEVENZIP_BINARIES),
         )
     else:
-        log.info("7z binary OK: %s (handles zip, 7z, rar)", sevenzip)
+        log.info("7z binaries on PATH: %s", ", ".join(sevenzips))
 
-    unrar = _first_on_path(UNRAR_BINARIES)
-    if unrar is None:
+    unrars = _all_on_path(UNRAR_BINARIES)
+    if not unrars:
         log.info(
             "unrar binary not on PATH — fine for zip/7z/older RAR, "
             "but install `unrar` if your users send fresh RAR5 "
             "archives that p7zip rejects with 'Unsupported Method'."
         )
     else:
-        log.info("unrar binary OK: %s (RAR5 fallback enabled)", unrar)
+        log.info("unrar binaries on PATH: %s", ", ".join(unrars))
+
+    bundled = Path("/app/bin/7zz")
+    if bundled.is_file():
+        on_path = shutil.which("7zz")
+        if on_path == str(bundled):
+            log.info("bundled 7zz at %s is the active 7zz", bundled)
+        elif on_path:
+            log.info(
+                "bundled 7zz at %s exists but a different 7zz is "
+                "active first on PATH: %s",
+                bundled,
+                on_path,
+            )
+        else:
+            log.warning(
+                "bundled 7zz at %s exists but is NOT on PATH — the "
+                "deploy startCommand should prepend /app/bin to PATH "
+                "(see railpack.json deploy.startCommand)",
+                bundled,
+            )
 
 
 def main() -> None:
