@@ -52,6 +52,22 @@ SEVENZIP_BINARIES: tuple[str, ...] = ("7zz", "7z", "7za")
 # also crack RAR4 and RAR5 in many cases and is widely preinstalled.
 UNRAR_BINARIES: tuple[str, ...] = ("unrar", "unrar-free", "bsdtar")
 
+# Directories on disk where a build step may have dropped a bundled
+# extractor binary. ``/app/bin`` is the canonical bundled location on
+# Railway / Railpack (see ``railpack.json``'s ``install-7zz`` step,
+# which downloads the upstream ``7zz`` binary into ``/app/bin/7zz``
+# so the bot can handle RAR3+ archives even when the deploy host's
+# only apt-available RAR reader is ``unrar-free`` 0.0.2 (RAR 2.0
+# only)). We look these dirs up directly on disk in addition to
+# ``$PATH`` so the bundled binary is picked up even when the deploy
+# runner forgets to prepend its directory to ``$PATH`` (which has
+# burned us multiple times — Procfile shell vs no-shell, startCommand
+# vs Procfile precedence, etc.).
+WELL_KNOWN_BUNDLED_BIN_DIRS: tuple[str, ...] = (
+    "/app/bin",
+    "/opt/bin",
+)
+
 # Substrings that mean "this binary refused / can't handle this
 # archive — try the next candidate". We match on lowercase stderr so
 # we don't accidentally swallow real failures (e.g. wrong password).
@@ -189,6 +205,18 @@ def detect_archive_kind(path: Path) -> Optional[str]:
 def _all_on_path(candidates: Sequence[str]) -> List[str]:
     """Return every candidate that resolves to a real binary, in order.
 
+    Looks for each candidate first in the well-known bundled-binary
+    directories (``/app/bin``, ``/opt/bin`` — see
+    :data:`WELL_KNOWN_BUNDLED_BIN_DIRS`) and then on ``$PATH``.
+    Bundled binaries are preferred because they're a known-good
+    version (Railway's ``railpack.json`` install step pins to upstream
+    7-Zip 26.01, which handles RAR3+ codecs that the apt-available
+    ``p7zip-full`` / ``unrar-free`` on Debian/Ubuntu can't); we also
+    look them up *directly on disk* rather than via ``shutil.which``
+    so the lookup works even when the deploy runner forgets to
+    prepend the bundled dir to ``$PATH`` (which has burned us in
+    every deploy iteration so far).
+
     Dedupes by both the on-PATH lookup (so the same alias isn't run
     twice) AND by the resolved physical path. On Debian/Ubuntu
     ``unrar`` is provided by the ``unrar-free`` package via
@@ -201,19 +229,30 @@ def _all_on_path(candidates: Sequence[str]) -> List[str]:
     out: List[str] = []
     seen_path: set[str] = set()
     seen_real: set[str] = set()
-    for c in candidates:
-        path = shutil.which(c)
+
+    def _consider(path: Optional[str]) -> None:
         if not path or path in seen_path:
-            continue
+            return
         seen_path.add(path)
         try:
             real = os.path.realpath(path)
         except OSError:
             real = path
         if real in seen_real:
-            continue
+            return
         seen_real.add(real)
         out.append(path)
+
+    for c in candidates:
+        # Bundled binaries first — they're guaranteed-known versions
+        # and we look them up on disk so a missing PATH entry can't
+        # hide them.
+        for bundled_dir in WELL_KNOWN_BUNDLED_BIN_DIRS:
+            cand = os.path.join(bundled_dir, c)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                _consider(cand)
+        # Then anything else on the system ``$PATH``.
+        _consider(shutil.which(c))
     return out
 
 
