@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+from .bootstrap import ensure_bundled_7zz
+
 log = logging.getLogger(__name__)
 
 ARCHIVE_SUFFIXES: tuple[str, ...] = (".zip", ".7z", ".rar")
@@ -263,6 +265,38 @@ def _which_first(candidates: Sequence[str]) -> Optional[str]:
     return found[0] if found else None
 
 
+def _resolve_7z_candidates() -> List[str]:
+    """Build the ordered list of 7z-family binaries to try.
+
+    The runtime-bootstrapped ``7zz`` (downloaded from www.7-zip.org by
+    :mod:`pipeline.bootstrap`) is prepended whenever it's available, so
+    it wins over any older system ``7z`` / ``7za`` / ``7zz`` — that's
+    the whole point of bootstrapping it: the system p7zip on common
+    PaaS hosts is too old to read every modern RAR / 7z codec.
+
+    Both the bundled binary and the PATH candidates are deduped by
+    realpath so a single physical file isn't run twice.
+    """
+    on_path = _all_on_path(SEVENZIP_BINARIES)
+    bundled = ensure_bundled_7zz()
+    if not bundled:
+        return on_path
+    try:
+        bundled_real = os.path.realpath(bundled)
+    except OSError:
+        bundled_real = bundled
+    out: List[str] = [bundled]
+    for c in on_path:
+        try:
+            real = os.path.realpath(c)
+        except OSError:
+            real = c
+        if real == bundled_real:
+            continue
+        out.append(c)
+    return out
+
+
 def _build_7z_cmd(
     bin_path: str,
     archive_path: Path,
@@ -460,7 +494,7 @@ def extract_archive(
             "(magic bytes don't match zip/7z/rar)"
         )
 
-    sevenzips = _all_on_path(SEVENZIP_BINARIES)
+    sevenzips = _resolve_7z_candidates()
     unrars = _all_on_path(UNRAR_BINARIES) if kind == "rar" else []
 
     if not sevenzips and not unrars:

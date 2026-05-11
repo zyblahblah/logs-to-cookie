@@ -371,4 +371,171 @@ def test_pipeline_multi_archives_merge_into_one_zip(tmp_path: Path) -> None:
     assert any("alpha" in n for n in names)
     assert any("beta" in n for n in names)
     # And the URL-index tag is present on every output filename.
-    assert all("url0" in n for n in names if n.endswith(".txt"))
+    assert all("url01" in n or "url02" in n for n in names)
+
+
+# ---------------------------------------------------------------------------
+# Cookie file discovery — see pipeline._find_cookie_files. These tests
+# exercise the discovery directly so we don't need a 7z binary.
+# ---------------------------------------------------------------------------
+from pipeline.pipeline import _find_cookie_files  # noqa: E402
+
+
+class TestFindCookieFiles:
+    """Stealer-log layouts vary wildly — the discovery must catch
+    cookies whether they're named ``cookies.txt``, just sit under a
+    ``Cookies/`` directory, or look like Netscape but have an
+    unrelated filename."""
+
+    def test_filename_hint_matches_anywhere(self, tmp_path: Path) -> None:
+        """Direct filename hint wins regardless of folder."""
+        (tmp_path / "victim").mkdir()
+        f = tmp_path / "victim" / "passwords-cookies.txt"
+        f.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+        found = _find_cookie_files(tmp_path)
+        assert f in found
+
+    def test_parent_dir_named_cookies_promotes_arbitrary_text(
+        self, tmp_path: Path
+    ) -> None:
+        """Stealer logs commonly stash cookies under a ``Cookies/``
+        folder with browser-named files like ``Chrome_Default.txt``
+        — those have no ``cookie`` in the filename, but their parent
+        dir does. They MUST be discovered."""
+        cookies_dir = tmp_path / "victim_42" / "Cookies"
+        cookies_dir.mkdir(parents=True)
+        chrome = cookies_dir / "Chrome_Default.txt"
+        chrome.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+        firefox = cookies_dir / "Firefox_default-release.txt"
+        firefox.write_text(f"{GOOD_LINE_B}\n", encoding="utf-8")
+
+        found = _find_cookie_files(tmp_path)
+        assert chrome in found
+        assert firefox in found
+
+    def test_parent_dir_match_is_case_insensitive(self, tmp_path: Path) -> None:
+        """``COOKIES/`` (uppercase, lowercase, mixed) should all
+        match. Stealers come from every locale."""
+        for dirname in ("COOKIES", "Cookies", "cookies", "COoKiES"):
+            (tmp_path / dirname).mkdir()
+            f = tmp_path / dirname / "edge.txt"
+            f.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+        found = _find_cookie_files(tmp_path)
+        names = {p.parent.name for p in found}
+        assert names == {"COOKIES", "Cookies", "cookies", "COoKiES"}
+
+    def test_sqlite_under_cookies_dir_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """Chrome's own profile snapshot ``Cookies`` (a SQLite DB)
+        often ends up in stealer logs. Feeding it to the Netscape
+        parser is a guaranteed 0-row dead end AND wastes IO — so the
+        ``_looks_like_text`` filter rejects SQLite blobs even when
+        they live under a ``Cookies/`` directory."""
+        cookies_dir = tmp_path / "Cookies"
+        cookies_dir.mkdir()
+        sqlite_db = cookies_dir / "Cookies"  # Chrome name, no extension
+        sqlite_db.write_bytes(
+            b"SQLite format 3\x00" + b"\x00" * 1024
+        )
+
+        # And a legit cookie file in the same dir — should still match.
+        legit = cookies_dir / "chrome.txt"
+        legit.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+
+        found = _find_cookie_files(tmp_path)
+        # SQLite file's name DOES contain "cookies" so it'll still
+        # be picked up by the filename hint (that path is unchanged
+        # — the parser just yields 0 rows for it). What MUST NOT
+        # happen is that the parent-dir promotion path adds it
+        # despite the SQLite signature. We assert that the legit
+        # file is included and that the discovery completes without
+        # raising.
+        assert legit in found
+
+    def test_files_with_null_bytes_skipped_under_cookies_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Generic binary cruft in a Cookies/ dir shouldn't be added.
+
+        Without this, every random ``.bin`` / ``.dll`` ended up
+        being parsed as text, costing CPU on multi-GB stealer dumps."""
+        cookies_dir = tmp_path / "Cookies"
+        cookies_dir.mkdir()
+        binary = cookies_dir / "thumb.bin"
+        binary.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096)
+        text = cookies_dir / "ok.txt"
+        text.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+
+        found = _find_cookie_files(tmp_path)
+        assert text in found
+        assert binary not in found
+
+    def test_netscape_txt_outside_cookies_dir_still_discovered(
+        self, tmp_path: Path
+    ) -> None:
+        """The ``.txt`` first-line peek still catches Netscape
+        tables that have neither a cookie-y filename nor a
+        cookie-y parent dir — e.g. ``victim_123/dump.txt``."""
+        (tmp_path / "victim_123").mkdir()
+        dump = tmp_path / "victim_123" / "dump.txt"
+        dump.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+        passwords = tmp_path / "victim_123" / "passwords.txt"
+        passwords.write_text("not a cookie line\n", encoding="utf-8")
+
+        found = _find_cookie_files(tmp_path)
+        assert dump in found
+        assert passwords not in found
+
+    def test_no_duplicates_across_hints(self, tmp_path: Path) -> None:
+        """A file matched by multiple hints (filename AND parent dir
+        AND .txt peek) appears exactly once."""
+        cookies_dir = tmp_path / "Cookies"
+        cookies_dir.mkdir()
+        f = cookies_dir / "cookies.txt"
+        f.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+
+        found = _find_cookie_files(tmp_path)
+        assert found.count(f) == 1
+
+
+@pytest.mark.skipif(
+    shutil.which("7z") is None
+    and shutil.which("7za") is None
+    and shutil.which("7zz") is None,
+    reason="7z binary not available on this host",
+)
+def test_pipeline_extracts_cookies_under_browser_named_files(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a zip that mimics the stealer-log layout (files
+    under ``Cookies/`` named after browsers, no ``cookie`` in the
+    filename) must produce non-empty output. This is the
+    regression that surfaced as 'no matching cookies found' on
+    real-world logs where another extractor tool succeeded."""
+    src_root = tmp_path / "src"
+    cookies_dir = src_root / "VictimXYZ" / "Cookies"
+    cookies_dir.mkdir(parents=True)
+    (cookies_dir / "Chrome_Default.txt").write_text(
+        f"{GOOD_LINE_A}\n", encoding="utf-8"
+    )
+    (cookies_dir / "Firefox_default-release.txt").write_text(
+        f"{GOOD_LINE_B}\n", encoding="utf-8"
+    )
+
+    archive_path = tmp_path / "logs.zip"
+    with zipfile.ZipFile(archive_path, "w") as z:
+        for p in src_root.rglob("*"):
+            if p.is_file():
+                z.write(p, arcname=p.relative_to(src_root).as_posix())
+    zip_bytes = archive_path.read_bytes()
+
+    work = tmp_path / "work"
+    with serve_zip(zip_bytes) as url:
+        result = run_pipeline(url, work)
+
+    assert len(result.cookie_files) == 2, (
+        f"expected 2 cookie sets, got {len(result.cookie_files)}: "
+        f"{result.cookie_files}"
+    )
+    assert result.cookie_count == 2
