@@ -44,6 +44,7 @@ import os
 import shutil
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -51,7 +52,14 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -90,6 +98,34 @@ STATE_PATH = Path(os.getenv("STATE_PATH", "state.json")).expanduser()
 # rate-limited at roughly 1 edit / second per chat. We coalesce our
 # in-flight edits to avoid hitting ``RetryAfter`` and falling behind.
 EDIT_MIN_INTERVAL = float(os.getenv("EDIT_MIN_INTERVAL", "1.2"))
+
+# Result-upload timeouts. PTB's HTTPX defaults (5s read / 5s write,
+# 1s pool) are tuned for small status messages — sending a multi-MB
+# result zip from Railway over a slow link routinely blew past them
+# and (with no error_handler registered) left the user staring at
+# "\U0001f4e4 Uploading result..." with no progress for 30+ minutes.
+# We override the per-request defaults via the Application builder so
+# every bot call benefits, and additionally wrap ``send_document`` in
+# a bounded retry loop — see ``_send_zip_with_retry`` below.
+UPLOAD_READ_TIMEOUT = float(os.getenv("UPLOAD_READ_TIMEOUT", "60"))
+UPLOAD_WRITE_TIMEOUT = float(os.getenv("UPLOAD_WRITE_TIMEOUT", "300"))
+UPLOAD_CONNECT_TIMEOUT = float(os.getenv("UPLOAD_CONNECT_TIMEOUT", "30"))
+# Maximum number of times we retry a transient upload failure (TimedOut,
+# NetworkError, RetryAfter). Counted across the whole send — the bot
+# always surfaces a clear error after this many attempts so the user
+# is never left staring at a stale "Uploading result..." message.
+UPLOAD_MAX_ATTEMPTS = int(os.getenv("UPLOAD_MAX_ATTEMPTS", "4"))
+# Hard ceiling on a single send attempt. Even with all timeouts set
+# correctly, ``asyncio.wait_for`` guarantees the coroutine returns
+# within this many seconds no matter what HTTPX / Telegram do.
+UPLOAD_ATTEMPT_DEADLINE = float(
+    os.getenv("UPLOAD_ATTEMPT_DEADLINE", "360")
+)
+# Cap on the ``retry_after`` value we'll honour from Telegram. If
+# Telegram asks us to wait 30 minutes we'd rather tell the user.
+UPLOAD_MAX_RETRY_AFTER = float(
+    os.getenv("UPLOAD_MAX_RETRY_AFTER", "120")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +315,183 @@ def _split_passwords(text: str) -> List[Optional[str]]:
         else:
             out.append(chunk)
     return out
+
+
+class _UploadFailed(Exception):
+    """Raised when ``send_document`` couldn't deliver after retries.
+
+    Carries ``attempts`` and ``last_error`` so the calling handler
+    can show the user a clear error instead of leaving them stuck on
+    the "📤 Uploading result..." status forever (the bug that
+    prompted this whole code path)."""
+
+    def __init__(self, attempts: int, last_error: str) -> None:
+        super().__init__(
+            f"upload failed after {attempts} attempt(s): {last_error}"
+        )
+        self.attempts = attempts
+        self.last_error = last_error
+
+
+def _summarize_upload_error(exc: BaseException) -> str:
+    """One-line, user-safe rendering of an upload error.
+
+    Strips the bot token if it accidentally lands in an HTTPX URL
+    inside the exception string. Telegram's ``RetryAfter`` includes
+    the requested wait time, which is useful context for the user.
+    """
+    if isinstance(exc, RetryAfter):
+        retry_after = getattr(exc, "retry_after", None)
+        return f"Telegram throttle (retry_after={retry_after}s)"
+    name = type(exc).__name__
+    msg = str(exc) or "no detail"
+    if BOT_TOKEN and BOT_TOKEN in msg:
+        msg = msg.replace(BOT_TOKEN, "<redacted>")
+    if len(msg) > 200:
+        msg = msg[:197] + "..."
+    return f"{name}: {msg}"
+
+
+async def _send_zip_with_retry(
+    bot,
+    *,
+    chat_id: int,
+    zip_path: Path,
+    caption: str,
+    edit_status,
+) -> None:
+    """Upload ``zip_path`` to ``chat_id`` with bounded retries.
+
+    Wraps :func:`telegram.Bot.send_document` with:
+
+    * A per-attempt :func:`asyncio.wait_for` ceiling
+      (:data:`UPLOAD_ATTEMPT_DEADLINE`) so a stuck HTTPX read can
+      never park the coroutine indefinitely.
+    * Configurable retry on :class:`TimedOut` / :class:`NetworkError`
+      with exponential backoff.
+    * Honoring :class:`RetryAfter` up to :data:`UPLOAD_MAX_RETRY_AFTER`
+      — beyond that we surface the error to the user rather than
+      sleeping for the requested 30 min.
+    * Re-opening the file path on every attempt so a partial first
+      write doesn't poison the retry (PTB consumes the buffer).
+
+    On terminal failure raises :class:`_UploadFailed` with the
+    attempt count and a redacted error summary.
+
+    Edits the chat's status message between attempts (best-effort —
+    failures in the status update are swallowed) so the user can
+    see retries happening instead of staring at a stale message.
+    """
+    last_error: str = "unknown error"
+    for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            try:
+                await edit_status(
+                    f"📤 Uploading result… (attempt {attempt}/"
+                    f"{UPLOAD_MAX_ATTEMPTS})\n"
+                    f"💬 last error: {last_error}"
+                )
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+        try:
+            # Pass the path directly, not an opened handle: PTB
+            # streams the file itself and a fresh open per attempt
+            # avoids dangling FDs from a partial previous send.
+            await asyncio.wait_for(
+                bot.send_document(
+                    chat_id=chat_id,
+                    document=str(zip_path),
+                    filename=zip_path.name,
+                    caption=caption,
+                    read_timeout=UPLOAD_READ_TIMEOUT,
+                    write_timeout=UPLOAD_WRITE_TIMEOUT,
+                    connect_timeout=UPLOAD_CONNECT_TIMEOUT,
+                    pool_timeout=UPLOAD_CONNECT_TIMEOUT,
+                ),
+                timeout=UPLOAD_ATTEMPT_DEADLINE,
+            )
+            return
+        except RetryAfter as exc:
+            retry_after = float(getattr(exc, "retry_after", 1.0) or 1.0)
+            last_error = _summarize_upload_error(exc)
+            log.warning(
+                "send_document RetryAfter on attempt %s/%s: "
+                "sleeping %.1fs",
+                attempt,
+                UPLOAD_MAX_ATTEMPTS,
+                retry_after,
+            )
+            if retry_after > UPLOAD_MAX_RETRY_AFTER:
+                # Telegram is asking us to wait too long — surface
+                # the failure instead of holding the chat hostage.
+                break
+            await asyncio.sleep(retry_after)
+            continue
+        except (BadRequest, Forbidden) as exc:
+            # 4xx-class API errors — "file too big", "chat not found",
+            # "bot was blocked", etc. Retrying won't help, so bail
+            # immediately with a clear error. Note: PTB models
+            # ``BadRequest`` as a subclass of ``NetworkError`` so this
+            # clause must come BEFORE the generic NetworkError retry
+            # path below, otherwise these get retried 4× for nothing.
+            last_error = _summarize_upload_error(exc)
+            log.error(
+                "send_document non-retryable failure: %s", last_error
+            )
+            raise _UploadFailed(attempt, last_error) from exc
+        except (TimedOut, NetworkError, asyncio.TimeoutError) as exc:
+            last_error = _summarize_upload_error(exc)
+            log.warning(
+                "send_document transient failure on attempt %s/%s: %s",
+                attempt,
+                UPLOAD_MAX_ATTEMPTS,
+                last_error,
+            )
+            # Exponential backoff capped at 30 s.
+            await asyncio.sleep(min(2.0 * (2 ** (attempt - 1)), 30.0))
+            continue
+        except TelegramError as exc:
+            # InvalidToken / Conflict / ChatMigrated etc — non-retryable.
+            last_error = _summarize_upload_error(exc)
+            log.error(
+                "send_document non-retryable failure: %s", last_error
+            )
+            raise _UploadFailed(attempt, last_error) from exc
+    raise _UploadFailed(UPLOAD_MAX_ATTEMPTS, last_error)
+
+
+async def _handle_uncaught_error(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Top-level error handler — logs the exception and tells the
+    chat about it when possible.
+
+    Without this, PTB silently swallows handler exceptions and the
+    user is left staring at whatever the last status edit said
+    (the exact UX bug reported as "stuck on Uploading result…").
+    """
+    err = getattr(context, "error", None)
+    log.error(
+        "uncaught error in handler: %s\n%s",
+        err,
+        "".join(traceback.format_exception(err)) if err else "",
+    )
+    try:
+        chat = None
+        if isinstance(update, Update):
+            chat = update.effective_chat
+        if chat is None:
+            return
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "❌ Internal error while handling your request. "
+                "The dev has been notified — please retry in a "
+                "minute or open /start again."
+            ),
+        )
+    except Exception:  # noqa: BLE001 — never re-raise from error_handler
+        log.exception("error_handler itself failed")
 
 
 def _friendly_pipeline_error(exc: Exception) -> str:
@@ -796,11 +1009,11 @@ async def _run_pipeline_for_job(
             f"📡 zip: {_human_bytes(zip_size)}\n"
             f"⏱️ Elapsed: {elapsed}s"
         )
-        with open(result.zip_path, "rb") as f:
-            await context.bot.send_document(
+        try:
+            await _send_zip_with_retry(
+                context.bot,
                 chat_id=chat_id,
-                document=f,
-                filename=result.zip_path.name,
+                zip_path=result.zip_path,
                 caption=(
                     f"✅ {len(result.cookie_files)} cookie set(s) — "
                     f"{result.cookie_count} cookies\n"
@@ -808,7 +1021,27 @@ async def _run_pipeline_for_job(
                     f"from {len(urls)} link(s)\n"
                     f"⏱️ {elapsed}s"
                 ),
+                edit_status=_edit_async,
             )
+        except _UploadFailed as exc:
+            log.exception(
+                "upload failed after %s attempt(s): %s",
+                exc.attempts,
+                exc,
+            )
+            await _edit_async(
+                "❌ Result was built but Telegram refused the upload "
+                f"after {exc.attempts} attempt(s).\n"
+                f"📦 {len(result.cookie_files)} cookie set(s) — "
+                f"{result.cookie_count} cookies\n"
+                f"📡 zip: {_human_bytes(zip_size)}\n"
+                f"⏱️ Elapsed: {elapsed}s\n"
+                f"💬 last error: {exc.last_error}\n"
+                "💡 Tip: try again in a minute, or re-run with a "
+                "stricter keyword filter to shrink the result."
+                + partial
+            )
+            return
         await _edit_async(
             f"✅ Done! Sent {_human_bytes(zip_size)} "
             f"({len(result.cookie_files)} sets, "
@@ -1037,7 +1270,24 @@ def build_app() -> Application:
             "provider's environment variables."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # PTB's HTTPXRequest defaults are too tight for multi-MB zip
+    # uploads from a PaaS worker — 5 s write_timeout is fine for
+    # /sendMessage but routinely stalls /sendDocument on a 6+ MB
+    # file from Railway. Bump the per-request timeouts globally
+    # via the builder so every bot call benefits; the upload-side
+    # retry loop in ``_send_zip_with_retry`` adds the rest of the
+    # belt-and-braces.
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(UPLOAD_READ_TIMEOUT)
+        .write_timeout(UPLOAD_WRITE_TIMEOUT)
+        .connect_timeout(UPLOAD_CONNECT_TIMEOUT)
+        .pool_timeout(UPLOAD_CONNECT_TIMEOUT)
+        .build()
+    )
+
+    app.add_error_handler(_handle_uncaught_error)
 
     conv = ConversationHandler(
         entry_points=[
