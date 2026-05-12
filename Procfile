@@ -1,1 +1,1 @@
-worker: PATH="/app/bin:$PATH" python bot.py
+worker: python bot.py

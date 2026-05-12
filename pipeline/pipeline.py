@@ -57,6 +57,20 @@ COOKIE_FILENAME_HINTS: Tuple[str, ...] = (
     "passwords-cookies",
 )
 
+# Binary file signatures we never want to feed to the Netscape parser
+# even when the file lives under a ``Cookies/`` directory. Chrome and
+# Edge store their own ``Cookies`` file as a SQLite database, so a raw
+# stealer dump that snapshots the browser's profile directory often
+# contains one. ``write_netscape_file`` would happily yield 0 rows for
+# it, but reading multi-MB binary blobs as text wastes IO; cheaper to
+# skip them outright.
+_BINARY_FILE_PREFIXES: Tuple[bytes, ...] = (
+    b"SQLite format 3",
+)
+# How many bytes we read from the head of a candidate file when
+# deciding whether it looks like plain text.
+_TEXT_PROBE_BYTES: int = 4096
+
 # Per-URL extraction worker count. The work is heavily I/O bound
 # (parsing big text files) so a small thread pool already saturates
 # typical disks; bumping it higher mostly costs RAM.
@@ -100,18 +114,91 @@ def _safe_name(name: str) -> str:
     return cleaned or "cookies"
 
 
+def _looks_like_text(path: Path) -> bool:
+    """Heuristic: ``True`` when ``path`` looks like a plain-text file.
+
+    Used to decide whether to feed a file under a ``Cookies/``
+    directory to the Netscape parser. We reject obvious binary
+    formats (SQLite, etc.) and anything with NUL bytes in the first
+    4 KB. Cookies stored as tab-separated text always pass this
+    check; SQLite ``Cookies`` databases (Chrome / Edge profile
+    snapshots) always fail it.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_TEXT_PROBE_BYTES)
+    except OSError:  # pragma: no cover
+        return False
+    if not head:
+        return False
+    for prefix in _BINARY_FILE_PREFIXES:
+        if head.startswith(prefix):
+            return False
+    return b"\x00" not in head[:1024]
+
+
+def _path_under_cookies_dir(rel: Path) -> bool:
+    """``True`` when any parent dir of ``rel`` mentions ``cookie(s)``.
+
+    Catches stealer-log layouts that put cookies in files whose own
+    name doesn't contain ``cookie`` — e.g.::
+
+        VictimID/Cookies/Chrome_Default.txt
+        VictimID/Browsers/Cookies/Firefox.txt
+        VictimID/Soft/Mozilla/Cookies/firefox.txt
+
+    Without this check, ``_find_cookie_files`` only matched the leaf
+    filename and skipped the file when it had no ``cookie`` substring.
+    """
+    for part in rel.parts[:-1]:
+        lp = part.lower()
+        if any(h in lp for h in COOKIE_FILENAME_HINTS):
+            return True
+    return False
+
+
 def _find_cookie_files(root: Path) -> List[Path]:
+    """Locate every file under ``root`` that might carry cookies.
+
+    Three signals get a file accepted:
+
+    1. The filename itself contains ``cookie`` / ``cookies`` /
+       ``passwords-cookies`` (case-insensitive substring match).
+    2. Any parent directory's name contains one of those substrings
+       AND the file looks like plain text. This is the stealer-log
+       case: a top-level ``Cookies/`` folder full of files named
+       after browsers, profiles, or hostnames.
+    3. The file ends in ``.txt`` and its first non-comment line
+       parses as a Netscape cookie row.
+
+    Files that match purely by being under a ``Cookies/`` directory
+    are filtered through :func:`_looks_like_text` so we don't try to
+    feed Chrome's own SQLite ``Cookies`` database to the parser.
+
+    Returned in deterministic sorted order.
+    """
     out: List[Path] = []
+    seen: set[Path] = set()
     for p in sorted(root.rglob("*")):
-        if not p.is_file():
+        if not p.is_file() or p in seen:
             continue
         lname = p.name.lower()
+        # 1) Filename hint.
         if any(h in lname for h in COOKIE_FILENAME_HINTS):
             out.append(p)
+            seen.add(p)
             continue
+        # 2) Parent path hint: file lives under a Cookies-like dir.
+        try:
+            rel = p.relative_to(root)
+        except ValueError:  # pragma: no cover
+            rel = Path(p.name)
+        if _path_under_cookies_dir(rel) and _looks_like_text(p):
+            out.append(p)
+            seen.add(p)
+            continue
+        # 3) .txt fallback: peek for a Netscape row.
         if lname.endswith(".txt"):
-            # Heuristic: peek at the first non-comment line and accept
-            # files that look like Netscape cookie tables.
             try:
                 with open(p, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
@@ -119,6 +206,7 @@ def _find_cookie_files(root: Path) -> List[Path]:
                             continue
                         if parse_cookie_line(line) is not None:
                             out.append(p)
+                            seen.add(p)
                         break
             except OSError:  # pragma: no cover
                 continue

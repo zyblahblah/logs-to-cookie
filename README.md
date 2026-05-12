@@ -88,25 +88,42 @@ cp .env.example .env  # then edit .env with your real BOT_TOKEN
 python bot.py
 ```
 
-You'll need `7z` (from `p7zip-full`) on your `$PATH` for archive
-extraction. The official upstream 7-Zip / `7zz` build handles `.zip`,
-`.7z`, and `.rar` (RAR4 and RAR5, including encrypted) on its own,
-but **the `p7zip-full` package shipped with Debian/Ubuntu does NOT
-include the RAR codec** — it lives in the separate non-free
-`p7zip-rar` package. So on Debian/Ubuntu you want at least one of:
+### Archive extractors
+
+The bot **bootstraps its own `7zz`** at runtime on first use: it
+downloads the official upstream 7-Zip 26.01 `7zz` binary (~1.5 MB,
+MIT-licensed, ships RAR3 / RAR4 / RAR5 codecs in-tree) into
+`~/.cache/logs-to-cookie/bin/7zz` and prepends it to the extractor
+chain. This means you no longer need any RAR-capable system package
+installed — the bot is self-sufficient on any Linux x64 / arm64 host
+that can reach `www.7-zip.org`.
+
+If you want to skip the runtime download (e.g. air-gapped host, or
+your network blocks egress to `www.7-zip.org`), set
+`LOGS_TO_COOKIE_DISABLE_7ZZ_BOOTSTRAP=1` and install the extractors
+yourself:
 
 ```bash
-# Most reliable: free RAR readers from main / universe (works on any
-# Debian/Ubuntu base image, including locked-down PaaS runtimes).
+# Free RAR readers from main / universe (no multiverse needed):
 sudo apt-get install -y p7zip-full unrar-free libarchive-tools
 # Or, if you can enable multiverse, the proprietary unrar / p7zip-rar:
 sudo apt-get install -y p7zip-full p7zip-rar unrar libarchive-tools
 ```
 
-The bot tries every extractor on `$PATH` in turn — `7zz` / `7z` /
-`7za` first, then `unrar`, then `unrar-free`, then `bsdtar`
-(libarchive) — so installing more than one is safe and just gives
-the bot more codecs to fall back on for stubborn RAR archives.
+The bot tries every extractor in turn — runtime-bundled `7zz` first,
+then `7z` / `7za` on `$PATH`, then `unrar`, then `unrar-free`, then
+`bsdtar` (libarchive). Each candidate is wiped + retried if the
+previous one leaves zero-byte placeholders.
+
+Extra env vars for the bootstrap:
+
+- `LOGS_TO_COOKIE_DISABLE_7ZZ_BOOTSTRAP=1` — opt out of the runtime
+  download entirely.
+- `LOGS_TO_COOKIE_7ZZ_CACHE_DIR=/path` — pin where the binary lives
+  (defaults to `$HOME/.cache/logs-to-cookie/bin`, then `/app/.cache/...`,
+  then `/tmp/logs-to-cookie-bin`).
+- `LOGS_TO_COOKIE_7ZZ_TARBALL_URL=https://...` — override the upstream
+  URL (useful for mirrors or local copies).
 
 ## Deploy to Railway
 
@@ -114,38 +131,27 @@ the bot more codecs to fall back on for stubborn RAR archives.
 2. Open *Variables* and set:
    - `BOT_TOKEN` — token from [@BotFather](https://t.me/BotFather)
    - `ADMIN_IDS` — comma-separated Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended).
-3. Deploy. `railpack.json` does three things:
-   - downloads the official upstream **7-Zip `7zz`** binary into `/app/bin/7zz` in the build image (handles RAR4/RAR5 natively, no `multiverse` apt feed needed);
-   - installs `p7zip-full`, `unrar-free`, and `libarchive-tools` via apt as belt-and-braces fallbacks;
-   - sets `deploy.startCommand` to `PATH="/app/bin:$PATH" python bot.py` so the bundled `7zz` is the first extractor the bot's chain finds (it's already preferred over `7z` / `7za`).
+3. Deploy. **No extra configuration is needed for RAR support.** The
+   bot downloads the upstream `7zz` binary on first start and caches
+   it under `/app/.cache/logs-to-cookie/bin/7zz` for the life of the
+   deploy. `railpack.json` additionally pre-bundles the binary at
+   build time as an optimization (saves the cold-start download) and
+   installs `unrar-free` + `libarchive-tools` as belt-and-braces
+   fallbacks.
 
-   The same `PATH=` prefix is mirrored in `Procfile` for non-Railpack hosts. `nixpacks.toml` is kept around for older Railway services / self-hosters that build with Nixpacks.
+> **Background.** Earlier releases relied on the bundled binary
+> being copied into `/app/bin/7zz` at build time via `railpack.json`'s
+> `deployOutputs`. That mechanism was fragile — see PR history #34 /
+> #35 / #36 — and silently no-ops if Railpack's custom-step / deploy
+> input wiring trips on a schema mismatch. The runtime bootstrap is
+> now the source of truth: even if the build-time bundle is missing
+> or broken, the bot still produces a working `7zz` on first start.
 
-> **Heads up — Railway uses Railpack, not Nixpacks, by default since
-> mid-2025.** That's why an earlier version of this README (which only
-> shipped `nixpacks.toml`) deployed fine but failed at runtime with
-> `❌ Error: 7z binary not found — install p7zip on your host.`.
-> Railpack ignores `nixpacks.toml` entirely; it reads `railpack.json`.
-> If you've forked an older copy, copy
-> [`railpack.json`](./railpack.json) into the root of your repo and
-> redeploy.
-
-> **Heads up — `p7zip-full` 16.02 (the version shipped on Debian /
-> Ubuntu / Railway) can NOT read .rar on its own.** The codec lives
-> in the non-free `p7zip-rar` package, which is in *multiverse*, which
-> Railpack's Ubuntu base image does not have enabled. `unrar-free`
-> only handles RAR 2.0 and bails on RAR3 / RAR4 / RAR5 with the
-> screenshot-bug `❌ extraction failed: 485 Failed`. To handle every
-> RAR generation without depending on multiverse, the build step in
-> `railpack.json` downloads the official upstream 7-Zip `7zz` binary
-> (1.5 MB tarball, MIT-licensed, ships RAR3 / RAR4 / RAR5 codecs
-> in-tree) into `/app/bin/` and the Procfile prepends that path so
-> the bot's extractor chain picks it up first. `unrar-free` and
-> `libarchive-tools` are still installed as last-resort fallbacks.
-> If you self-host on a machine that has multiverse enabled, you can
-> additionally install `p7zip-rar` and / or the proprietary `unrar`
-> — the bot's fallback chain walks every extractor on `$PATH` until
-> one succeeds.
+> **`p7zip-full` 16.02** (the version on Debian / Ubuntu / Railway) and
+> `unrar-free` 0.0.2 can *not* read every modern RAR5 codec. The
+> runtime-bundled `7zz` 26.01 does. If you've turned off the
+> bootstrap, expect "Unsupported Method" / "Only plain RAR 2.0
+> supported" failures on fresh stealer-log RAR archives.
 
 > **Rotate your token.** Anyone who has seen your bot token can
 > control the bot. If you've ever pasted it in chat, run

@@ -63,6 +63,7 @@ from telegram.ext import (
 
 from pipeline import AccessStore, Job, JobQueue, run_pipeline_multi
 from pipeline.archive import SEVENZIP_BINARIES, UNRAR_BINARIES, _all_on_path
+from pipeline.bootstrap import ensure_bundled_7zz
 
 load_dotenv()
 
@@ -1080,51 +1081,66 @@ def build_app() -> Application:
 
 
 def _check_extractor_binaries() -> None:
-    """Log every extractor on PATH at startup, plus diagnostics for
-    deploys where ``/app/bin/7zz`` was bundled but not picked up."""
+    """Log every extractor the bot will try, in chain order.
+
+    Pre-warms the runtime ``7zz`` bootstrap (see
+    :mod:`pipeline.bootstrap`) so the first archive job doesn't pay
+    the cold-start download cost. The bootstrap silently no-ops if
+    the platform isn't supported or the network is unreachable;
+    every diagnostic the operator needs to triage shows up in this
+    one log block.
+    """
     log.info("PATH=%s", os.environ.get("PATH", ""))
 
-    sevenzips = _all_on_path(SEVENZIP_BINARIES)
-    if not sevenzips:
-        log.warning(
-            "7z binary not found on PATH (looked for %s). "
-            "All archive extraction (zip / 7z / rar) will fail at "
-            "runtime. Install p7zip-full on your host (Railway: see "
-            "railpack.json; Debian/Ubuntu: apt-get install p7zip-full).",
-            ", ".join(SEVENZIP_BINARIES),
+    bundled = ensure_bundled_7zz()
+    if bundled:
+        log.info(
+            "runtime-bundled 7zz at %s (extractor chain will try this first)",
+            bundled,
         )
     else:
-        log.info("7z binaries on PATH: %s", ", ".join(sevenzips))
+        log.info(
+            "runtime-bundled 7zz unavailable \u2014 falling back to whatever "
+            "7z/unrar binaries are already on PATH"
+        )
+
+    sevenzips = _all_on_path(SEVENZIP_BINARIES)
+    if not sevenzips and not bundled:
+        log.warning(
+            "7z binary not found on PATH (looked for %s) and the "
+            "runtime bundle is also unavailable. All archive "
+            "extraction (zip / 7z / rar) will fail at runtime. "
+            "Install p7zip-full on your host (Debian/Ubuntu: "
+            "apt-get install p7zip-full) or let the bot reach "
+            "www.7-zip.org for the runtime bundle.",
+            ", ".join(SEVENZIP_BINARIES),
+        )
+    elif sevenzips:
+        log.info("system 7z binaries on PATH: %s", ", ".join(sevenzips))
+    else:
+        log.info("no system 7z binary on PATH; relying on runtime bundle")
 
     unrars = _all_on_path(UNRAR_BINARIES)
     if not unrars:
         log.info(
-            "unrar binary not on PATH — fine for zip/7z/older RAR, "
-            "but install `unrar` if your users send fresh RAR5 "
-            "archives that p7zip rejects with 'Unsupported Method'."
+            "unrar binary not on PATH \u2014 fine when the runtime 7zz "
+            "bundle is active (it handles RAR3/RAR4/RAR5 natively); "
+            "install `unrar` only if you've disabled the bundle."
         )
     else:
         log.info("unrar binaries on PATH: %s", ", ".join(unrars))
 
-    bundled = Path("/app/bin/7zz")
-    if bundled.is_file():
-        on_path = shutil.which("7zz")
-        if on_path == str(bundled):
-            log.info("bundled 7zz at %s is the active 7zz", bundled)
-        elif on_path:
-            log.info(
-                "bundled 7zz at %s exists but a different 7zz is "
-                "active first on PATH: %s",
-                bundled,
-                on_path,
-            )
-        else:
-            log.warning(
-                "bundled 7zz at %s exists but is NOT on PATH — the "
-                "deploy startCommand should prepend /app/bin to PATH "
-                "(see railpack.json deploy.startCommand)",
-                bundled,
-            )
+    # Heads-up about any legacy build-time bundling. The runtime
+    # bootstrap supersedes this entirely \u2014 we only check so
+    # operators carrying an older railpack.json don't get confused
+    # when the build-time binary doesn't end up first in the chain.
+    legacy_bundled = Path("/app/bin/7zz")
+    if legacy_bundled.is_file() and bundled and bundled != str(legacy_bundled):
+        log.info(
+            "legacy build-time 7zz at %s is shadowed by runtime bundle %s",
+            legacy_bundled,
+            bundled,
+        )
 
 
 def main() -> None:
