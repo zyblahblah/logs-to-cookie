@@ -332,10 +332,25 @@ class TestIsPasswordError:
     def test_wrong_password_phrase(self) -> None:
         assert _is_password_error("ERROR: Wrong password?\n") is True
 
-    def test_headers_error_alone(self) -> None:
-        # Header-encrypted .7z without a password sometimes prints
-        # only "Headers Error" — still a password problem.
-        assert _is_password_error("ERRORS:\nHeaders Error\n") is True
+    def test_headers_error_alone_is_NOT_password_error(self) -> None:
+        # ``Headers Error`` on its own is too ambiguous to classify
+        # as a password failure: p7zip / 7zz emits the same phrase
+        # on a TRUNCATED download, a CORRUPT archive, or a CODEC
+        # GAP — none of which are password problems.
+        #
+        # On a real wrong-password failure the extractor always
+        # emits the companion phrase ``Can(?:not| not) open
+        # encrypted archive. Wrong password?`` (see
+        # ``P7ZIP_ENCRYPTED_BLOB`` above and the ``test_p7zip_
+        # encrypted_no_password`` case below). Matching that
+        # phrase still classifies the case correctly — the bare
+        # ``Headers Error`` is just a noisy companion line.
+        #
+        # Before this assertion was flipped, the bot told users
+        # "the password looks wrong" on truncated downloads of
+        # un-encrypted RAR archives — a confusing false positive
+        # that sent them re-typing a password they never needed.
+        assert _is_password_error("ERRORS:\nHeaders Error\n") is False
 
     def test_plain_failure_is_not_password_error(self) -> None:
         assert _is_password_error(P7ZIP_NOT_AN_ARCHIVE_BLOB) is False
@@ -375,6 +390,53 @@ class TestLastUsefulLine:
             "just one diagnostic line"
         )
 
+    def test_strips_archive_property_listing(self) -> None:
+        # ``Volumes = 1`` / ``Path = ...`` / ``Type = Rar5`` etc. are
+        # archive METADATA, not failure reasons. They appear above
+        # the real error in every 7zz / p7zip extraction blob. If
+        # the only "lines" left after filtering the summary footer
+        # are property lines, we'd previously surface
+        # ``"extraction failed: Volumes = 1"`` to the user — the
+        # exact screenshot bug we're fixing here.
+        blob = (
+            "7-Zip (z) 26.01 (x64)\n"
+            "Scanning the drive for archives:\n"
+            "1 file, 200 bytes (1 KiB)\n"
+            "\n"
+            "Extracting archive: tiny.rar\n"
+            "--\n"
+            "Path = tiny.rar\n"
+            "Type = Rar5\n"
+            "Physical Size = 299\n"
+            "Encrypted = -\n"
+            "Solid = -\n"
+            "Blocks = 0\n"
+            "Multivolume = -\n"
+            "Volumes = 1\n"
+            "Comment = \n"
+            "Sub items Errors: 1\n"
+            "Archives with Errors: 1\n"
+            "Open Errors: 1\n"
+        )
+        line = _last_useful_line(blob)
+        low = line.lower()
+        assert "volumes" not in low
+        assert "path =" not in low
+        assert "type =" not in low
+
+    def test_property_only_blob_falls_back_to_generic(self) -> None:
+        # If LITERALLY every diagnostic line is an archive property
+        # listing (no real error message at all), the user should
+        # see a generic ``extraction failed`` rather than a
+        # confusing ``Volumes = 1`` / ``Path = ...`` tail.
+        blob = (
+            "Path = /tmp/foo.rar\n"
+            "Type = Rar5\n"
+            "Solid = -\n"
+            "Volumes = 1\n"
+        )
+        assert _last_useful_line(blob) == "extraction failed"
+
     def test_skips_blank_and_bare_error_lines(self) -> None:
         blob = "\n\nERRORS\n\nthe real error\nFiles: 0\nCompressed: 0\n"
         assert _last_useful_line(blob) == "the real error"
@@ -413,6 +475,29 @@ class TestDestHasFiles:
     def test_missing_dir_is_false(self, tmp_path: Path) -> None:
         # Defensive: should not raise, just report "no files".
         assert _dest_has_files(tmp_path / "does-not-exist") is False
+
+    def test_zero_byte_files_are_false(self, tmp_path: Path) -> None:
+        # On a per-file-encrypted RAR (the ``@CenturionTXT``
+        # stealer-log layout), ``7zz`` creates one 0-byte placeholder
+        # per archive entry before bailing with ``ERROR: Wrong
+        # password``. Treating those as "files extracted" would skip
+        # the password-error classification and hand 0-byte files to
+        # the cookie parser instead.
+        d = tmp_path / "placeholders"
+        d.mkdir()
+        (d / "@CenturionTXT.txt").write_bytes(b"")
+        (d / "@CenturionTXT.jpg").write_bytes(b"")
+        assert _dest_has_files(d) is False
+
+    def test_mixed_real_and_zero_byte_files_is_true(self, tmp_path: Path) -> None:
+        # As long as ONE real file made it through, extraction
+        # genuinely produced something useful. The bot can still
+        # parse cookies from that one file.
+        d = tmp_path / "partial"
+        d.mkdir()
+        (d / "empty.txt").write_bytes(b"")
+        (d / "cookies.txt").write_text("x", encoding="utf-8")
+        assert _dest_has_files(d) is True
 
 
 class TestDecodeSubprocBytes:
