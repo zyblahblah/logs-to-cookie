@@ -112,27 +112,50 @@ _UNRAR_FREE_FAILED_RE = re.compile(
 # These are NOT retryable — trying the next extractor will only
 # reproduce the same failure. We surface a friendly "wrong / missing
 # password" message instead.
+#
+# NOTE: we deliberately do NOT include the bare phrase ``"headers
+# error"`` here. p7zip / 7zz emit ``ERRORS:\nHeaders Error`` for any
+# unreadable archive header — wrong password is one cause, but a
+# truncated download or a codec gap on a non-encrypted archive will
+# emit the same line. Matching it alone produced false ``password
+# looks wrong`` errors on archives that weren't encrypted at all.
+# The companion phrase ``"Can(?:not| not) open encrypted archive.
+# Wrong password?"`` is always present on a true password failure,
+# so we still catch the real case below without the false positives.
 _PASSWORD_ERROR_FRAGMENTS: tuple[str, ...] = (
     "wrong password",
     "can not open encrypted archive",
     "cannot open encrypted archive",
     "the password is incorrect",
     "encrypted file. corrupt file or wrong password",
-    "headers error",
 )
 
-# Footer lines emitted by p7zip / 7-Zip after the real error, e.g.
-#   ERROR: foo.rar
-#   Can not open the file as archive
+# Footer / property lines emitted by p7zip / 7-Zip alongside the
+# real error, e.g.
 #
-#   Can't open as archive: 1
+#   Extracting archive: foo.rar
+#   --
+#   Path = foo.rar
+#   Type = Rar5
+#   Physical Size = 1234
+#   Encrypted = -
+#   Solid = -
+#   Blocks = 1
+#   Multivolume = -
+#   Volumes = 1            ← NOT an error — just archive metadata
+#   Comment = ...
+#   ERROR: <the real failure goes here>
+#   ...
+#   Sub items Errors: 1
+#   Archives with Errors: 1
 #   Files: 0
 #   Size:       0
 #   Compressed: 0
 #
-# We strip these out of "last useful line" detection so the user
-# sees the real failure ("Can not open the file as archive") instead
-# of a meaningless "Compressed: 0".
+# We strip both the footer summary AND the archive-property listing
+# out of ``_last_useful_line`` detection so the user sees the real
+# failure instead of meaningless metadata like ``"Volumes = 1"`` or
+# ``"Compressed: 0"``.
 _NOISE_LINE_PREFIXES: tuple[str, ...] = (
     "files:",
     "size:",
@@ -143,6 +166,23 @@ _NOISE_LINE_PREFIXES: tuple[str, ...] = (
     "errors:",
     "warnings:",
     "open errors:",
+    # 7zz / p7zip archive-properties block. Each line is ``<key> =
+    # <value>``. None of them describe a failure on their own, so
+    # promote them to noise to keep them out of the user-facing tail.
+    "path = ",
+    "type = ",
+    "physical size = ",
+    "headers size = ",
+    "total physical size = ",
+    "method = ",
+    "solid = ",
+    "blocks = ",
+    "multivolume = ",
+    "volume index = ",
+    "volumes = ",
+    "encrypted = ",
+    "characteristics = ",
+    "comment = ",
 )
 
 
@@ -220,15 +260,38 @@ def _all_on_path(candidates: Sequence[str]) -> List[str]:
 
 
 def _dest_has_files(dest_dir: Path) -> bool:
-    """Return True iff ``dest_dir`` contains at least one regular file
-    (recursively). ``unrar-free`` and a few other extractors return
-    rc=0 even when they fail to actually extract anything — checking
-    the filesystem is the only reliable signal.
+    """Return True iff ``dest_dir`` contains at least one non-empty
+    regular file (recursively).
+
+    ``unrar-free`` and a few other extractors return rc=0 even when
+    they fail to actually extract anything — checking the filesystem
+    is the only reliable signal.
+
+    Zero-byte files specifically are treated as "no files" because:
+
+    * ``7zz`` on a per-file-encrypted RAR (the ``@CenturionTXT``
+      stealer-log layout) creates one 0-byte placeholder per archive
+      entry before bailing with ``ERROR: Wrong password``. With
+      those files surviving, the next extractor on the chain would
+      skip its attempt and the bot would silently hand 0-byte files
+      to the cookie parser instead of surfacing the real
+      ``wrong password`` failure.
+    * Old p7zip 16.02 does the same on ``Unsupported Method``
+      failures (the original ``485 Failed`` bug case).
+
+    A successful extraction always writes at least one byte (a
+    legitimate empty file in the archive is vanishingly rare and
+    isn't worth a special case here).
     """
     try:
         for entry in dest_dir.rglob("*"):
-            if entry.is_file():
-                return True
+            if not entry.is_file():
+                continue
+            try:
+                if entry.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
     except OSError:
         pass
     return False
@@ -313,6 +376,71 @@ def _build_7z_cmd(
         "--",
         str(archive_path),
     ]
+
+
+def _build_extractor_cmd(
+    bin_path: str,
+    archive_path: Path,
+    dest_dir: Path,
+    password: Optional[str],
+) -> List[str]:
+    """Pick the right ``_build_*_cmd`` for whichever extractor
+    ``bin_path`` happens to be.
+
+    Used by the password-variant retry loop so the inner-retry path
+    doesn't have to care which family of extractor it's talking to.
+    """
+    name = Path(bin_path).name.lower()
+    if name in ("unrar", "unrar-free", "bsdtar"):
+        return _build_unrar_cmd(bin_path, archive_path, dest_dir, password)
+    return _build_7z_cmd(bin_path, archive_path, dest_dir, password)
+
+
+def _password_variants(password: Optional[str]) -> List[Optional[str]]:
+    """Build a short list of password candidates from ``password``.
+
+    Stealer-log channels routinely post passwords as Telegram
+    auto-linked URLs. The pinned message reads ``Pass:
+    https://t.me/CenturionTXT`` because Telegram automatically wraps
+    bare ``t.me/...`` strings in ``https://`` to make them
+    tappable, but the **literal** password the channel owner typed
+    when creating the archive is just ``t.me/CenturionTXT``. Users
+    who long-press the displayed text to copy get the
+    ``https://``-prefixed form and the bot then correctly reports
+    "wrong password" on what looks to the user like the right
+    password.
+
+    Rather than hand-train every user on Telegram's URL formatting,
+    we **transparently** retry without the ``http(s)://`` scheme
+    and/or the trailing slash. The literal password is always tried
+    first so a real password that happens to start with
+    ``https://`` still works.
+
+    Returns a list with the original password first, followed by any
+    distinct stripped forms. No-op for ``None`` / empty passwords.
+    """
+    if password is None or password == "":
+        return [password]
+    out: List[Optional[str]] = [password]
+    seen = {password}
+
+    def _add(candidate: str) -> None:
+        if candidate and candidate not in seen:
+            out.append(candidate)
+            seen.add(candidate)
+
+    low = password.lower()
+    stripped = password
+    if low.startswith("https://"):
+        stripped = password[len("https://"):]
+    elif low.startswith("http://"):
+        stripped = password[len("http://"):]
+    _add(stripped)
+    if stripped.endswith("/"):
+        _add(stripped.rstrip("/"))
+    if password.endswith("/"):
+        _add(password.rstrip("/"))
+    return out
 
 
 def _build_unrar_cmd(
@@ -433,11 +561,18 @@ def _last_useful_line(blob: str) -> str:
 
     7z and p7zip both end their output with a summary footer (``Files:
     0``, ``Size: 0``, ``Compressed: 0``, ``Can't open as archive: 1``,
-    ``Archives with Errors: 1``, etc.) that says nothing about *why*
-    extraction failed. We skip those noise lines and return the last
-    line that actually tells the user something — typically the
-    ``Can not open the file as archive`` / ``Wrong password?`` line
-    immediately above the footer.
+    ``Archives with Errors: 1``, etc.) and a property-listing block
+    (``Path = ...``, ``Type = ...``, ``Volumes = 1``, ...) that says
+    nothing about *why* extraction failed. We skip those noise lines
+    and return the last line that actually tells the user something
+    — typically the ``Can not open the file as archive`` / ``Wrong
+    password?`` line immediately above the footer.
+
+    If every line is noise we fall back to a generic
+    ``"extraction failed"`` rather than reaching past the noise
+    filter for the raw last line. Returning ``"Volumes = 1"`` to the
+    user is worse than returning a generic phrase — at least
+    ``extraction failed`` is honest about the lack of diagnostic.
     """
     candidates: List[str] = []
     for line in blob.splitlines():
@@ -457,11 +592,6 @@ def _last_useful_line(blob: str) -> str:
         candidates.append(s)
     if candidates:
         return candidates[-1]
-    # Fall back to the previous behaviour if every line is noise.
-    for line in reversed(blob.splitlines()):
-        s = line.strip()
-        if s:
-            return s
     return "extraction failed"
 
 
@@ -585,9 +715,33 @@ def extract_archive(
         )
         if _is_password_error(blob):
             # Wrong / missing password is decisive: no other extractor
-            # will get any further. Surface a friendly message that
-            # the bot's user-facing layer can match on.
+            # will get any further with the SAME password. But before
+            # giving up, try a small set of "what the user probably
+            # meant" variants on this same extractor — see
+            # ``_password_variants`` for the full rationale. The most
+            # common real-world hit is a Telegram channel that posts
+            # ``Pass: https://t.me/Foo`` for an archive whose literal
+            # password is just ``t.me/Foo`` (Telegram auto-wraps
+            # bare ``t.me`` URLs in ``https://`` for display).
             if password:
+                variants = _password_variants(password)
+                for variant in variants[1:]:  # variants[0] == password
+                    log.info(
+                        "trying password variant on %s",
+                        Path(bin_path).name,
+                    )
+                    _wipe_dir_contents(dest_dir)
+                    variant_cmd = _build_extractor_cmd(
+                        bin_path, archive_path, dest_dir, variant
+                    )
+                    v_rc, _v_blob = _stderr_blob(variant_cmd, timeout)
+                    if v_rc == 0 and _dest_has_files(dest_dir):
+                        log.info(
+                            "extraction OK with %s "
+                            "(after password-variant retry)",
+                            Path(bin_path).name,
+                        )
+                        return dest_dir
                 raise ArchiveError(
                     "extraction failed: wrong password for archive"
                 )
@@ -599,6 +753,17 @@ def extract_archive(
             # Real failure (corrupt archive, etc.) — no point trying
             # every other extractor.
             tail = _last_useful_line(blob)
+            # ``_last_useful_line`` may legitimately return its
+            # ``"extraction failed"`` fallback when every diagnostic
+            # line is archive metadata / footer noise. Concatenating
+            # that with the outer ``extraction failed: `` prefix
+            # gives the user a useless ``extraction failed:
+            # extraction failed`` echo — collapse it instead.
+            if tail == "extraction failed":
+                raise ArchiveError(
+                    f"extraction failed (no readable diagnostic from "
+                    f"{Path(bin_path).name}; rc={rc})"
+                )
             raise ArchiveError(f"extraction failed: {tail}")
 
     # Every candidate gave up with a "retryable" complaint. Surface
@@ -644,6 +809,14 @@ def extract_archive(
         extra = (
             " — your p7zip build may be too old for this 7z codec; "
             "install a newer p7zip-full or the standalone `7zz`."
+        )
+    # Same fallback-noise collapse as in the per-extractor branch
+    # above: ``"extraction failed via bsdtar: extraction failed"``
+    # reads as a stutter to the user. Drop the inner phrase.
+    if tail == "extraction failed":
+        raise ArchiveError(
+            f"extraction failed via {Path(last_bin).name} "
+            f"(no readable diagnostic from any extractor){extra}"
         )
     raise ArchiveError(
         f"extraction failed via {Path(last_bin).name}: {tail}{extra}"

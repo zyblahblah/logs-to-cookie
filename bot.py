@@ -551,8 +551,16 @@ def _friendly_pipeline_error(exc: Exception) -> str:
         )
     if "wrong password" in low or ("data error" in low and "encrypted" in low):
         return (
-            "❌ Extraction failed — the password looks wrong for at "
-            "least one archive. Re-run /start and double-check it."
+            "❌ Extraction failed — the password the bot tried "
+            "didn't decrypt at least one archive.\n"
+            "💡 The bot already auto-strips `https://` and trailing "
+            "slashes (so `https://t.me/Foo` is silently retried as "
+            "`t.me/Foo`). If you still see this message it usually "
+            "means:\n"
+            "• Typo in the password (it's case-sensitive).\n"
+            "• The archive is encrypted with a different password "
+            "than the one in the channel post you read.\n"
+            "Re-run /start and try again."
         )
     if (
         "p7zip-full alone can't read .rar" in msg
