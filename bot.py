@@ -553,13 +553,13 @@ def _friendly_pipeline_error(exc: Exception) -> str:
         return (
             "❌ Extraction failed — the password the bot tried "
             "didn't decrypt at least one archive.\n"
-            "💡 Common causes:\n"
+            "💡 The bot already auto-strips `https://` and trailing "
+            "slashes (so `https://t.me/Foo` is silently retried as "
+            "`t.me/Foo`). If you still see this message it usually "
+            "means:\n"
             "• Typo in the password (it's case-sensitive).\n"
-            "• You pasted a Telegram channel URL instead of the "
-            "actual password — open the channel and look at the "
-            "pinned message for the real password string.\n"
             "• The archive is encrypted with a different password "
-            "than the one in the post you saw.\n"
+            "than the one in the channel post you read.\n"
             "Re-run /start and try again."
         )
     if (

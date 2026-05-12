@@ -378,6 +378,71 @@ def _build_7z_cmd(
     ]
 
 
+def _build_extractor_cmd(
+    bin_path: str,
+    archive_path: Path,
+    dest_dir: Path,
+    password: Optional[str],
+) -> List[str]:
+    """Pick the right ``_build_*_cmd`` for whichever extractor
+    ``bin_path`` happens to be.
+
+    Used by the password-variant retry loop so the inner-retry path
+    doesn't have to care which family of extractor it's talking to.
+    """
+    name = Path(bin_path).name.lower()
+    if name in ("unrar", "unrar-free", "bsdtar"):
+        return _build_unrar_cmd(bin_path, archive_path, dest_dir, password)
+    return _build_7z_cmd(bin_path, archive_path, dest_dir, password)
+
+
+def _password_variants(password: Optional[str]) -> List[Optional[str]]:
+    """Build a short list of password candidates from ``password``.
+
+    Stealer-log channels routinely post passwords as Telegram
+    auto-linked URLs. The pinned message reads ``Pass:
+    https://t.me/CenturionTXT`` because Telegram automatically wraps
+    bare ``t.me/...`` strings in ``https://`` to make them
+    tappable, but the **literal** password the channel owner typed
+    when creating the archive is just ``t.me/CenturionTXT``. Users
+    who long-press the displayed text to copy get the
+    ``https://``-prefixed form and the bot then correctly reports
+    "wrong password" on what looks to the user like the right
+    password.
+
+    Rather than hand-train every user on Telegram's URL formatting,
+    we **transparently** retry without the ``http(s)://`` scheme
+    and/or the trailing slash. The literal password is always tried
+    first so a real password that happens to start with
+    ``https://`` still works.
+
+    Returns a list with the original password first, followed by any
+    distinct stripped forms. No-op for ``None`` / empty passwords.
+    """
+    if password is None or password == "":
+        return [password]
+    out: List[Optional[str]] = [password]
+    seen = {password}
+
+    def _add(candidate: str) -> None:
+        if candidate and candidate not in seen:
+            out.append(candidate)
+            seen.add(candidate)
+
+    low = password.lower()
+    stripped = password
+    if low.startswith("https://"):
+        stripped = password[len("https://"):]
+    elif low.startswith("http://"):
+        stripped = password[len("http://"):]
+    _add(stripped)
+    if stripped.endswith("/"):
+        _add(stripped.rstrip("/"))
+    if password.endswith("/"):
+        _add(password.rstrip("/"))
+    return out
+
+
 def _build_unrar_cmd(
     bin_path: str,
     archive_path: Path,
@@ -650,9 +715,33 @@ def extract_archive(
         )
         if _is_password_error(blob):
             # Wrong / missing password is decisive: no other extractor
-            # will get any further. Surface a friendly message that
-            # the bot's user-facing layer can match on.
+            # will get any further with the SAME password. But before
+            # giving up, try a small set of "what the user probably
+            # meant" variants on this same extractor — see
+            # ``_password_variants`` for the full rationale. The most
+            # common real-world hit is a Telegram channel that posts
+            # ``Pass: https://t.me/Foo`` for an archive whose literal
+            # password is just ``t.me/Foo`` (Telegram auto-wraps
+            # bare ``t.me`` URLs in ``https://`` for display).
             if password:
+                variants = _password_variants(password)
+                for variant in variants[1:]:  # variants[0] == password
+                    log.info(
+                        "trying password variant on %s",
+                        Path(bin_path).name,
+                    )
+                    _wipe_dir_contents(dest_dir)
+                    variant_cmd = _build_extractor_cmd(
+                        bin_path, archive_path, dest_dir, variant
+                    )
+                    v_rc, _v_blob = _stderr_blob(variant_cmd, timeout)
+                    if v_rc == 0 and _dest_has_files(dest_dir):
+                        log.info(
+                            "extraction OK with %s "
+                            "(after password-variant retry)",
+                            Path(bin_path).name,
+                        )
+                        return dest_dir
                 raise ArchiveError(
                     "extraction failed: wrong password for archive"
                 )

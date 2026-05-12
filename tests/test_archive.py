@@ -170,6 +170,7 @@ from pipeline.archive import (  # noqa: E402
     _is_password_error,
     _is_retryable,
     _last_useful_line,
+    _password_variants,
     _run,
     _stderr_blob,
     _wipe_dir_contents,
@@ -355,6 +356,74 @@ class TestIsPasswordError:
     def test_plain_failure_is_not_password_error(self) -> None:
         assert _is_password_error(P7ZIP_NOT_AN_ARCHIVE_BLOB) is False
         assert _is_password_error("Everything is Ok") is False
+
+
+class TestPasswordVariants:
+    """``_password_variants`` builds the small set of "what the user
+    probably meant" candidates that ``extract_archive`` transparently
+    retries on a wrong-password failure.
+
+    The real-world hit rate target is the Telegram channel pattern:
+    a pinned message reads ``Pass: https://t.me/Foo`` because
+    Telegram auto-wraps bare ``t.me/...`` strings in ``https://``
+    for display, but the LITERAL password the channel owner typed
+    when packing the archive is just ``t.me/Foo``. Long-pressing
+    the displayed text to copy yields the ``https://``-prefixed
+    form, the bot sees "wrong password", the user re-types the
+    same thing and gets the same error — until this variant retry
+    lets the bot try both forms transparently.
+    """
+
+    def test_none_is_passthrough(self) -> None:
+        assert _password_variants(None) == [None]
+
+    def test_empty_is_passthrough(self) -> None:
+        assert _password_variants("") == [""]
+
+    def test_plain_password_has_no_variants(self) -> None:
+        # A normal password (no URL pattern) has nothing to strip.
+        # Don't waste an extraction attempt on a synthetic variant.
+        assert _password_variants("hunter2") == ["hunter2"]
+        assert _password_variants("claude") == ["claude"]
+
+    def test_https_prefix_is_stripped(self) -> None:
+        # The headline real-world case: Telegram auto-prepends
+        # ``https://`` to a bare ``t.me/...`` link in display.
+        variants = _password_variants("https://t.me/CenturionTXT")
+        assert variants == [
+            "https://t.me/CenturionTXT",
+            "t.me/CenturionTXT",
+        ]
+        # The original is ALWAYS tried first — a legitimate password
+        # that genuinely starts with ``https://`` still works.
+        assert variants[0] == "https://t.me/CenturionTXT"
+
+    def test_http_prefix_is_stripped(self) -> None:
+        # Some channels use the older ``http://`` form.
+        variants = _password_variants("http://example.com/Foo")
+        assert "example.com/Foo" in variants
+        assert variants[0] == "http://example.com/Foo"
+
+    def test_trailing_slash_is_stripped(self) -> None:
+        # ``https://t.me/Foo/`` gets BOTH the scheme strip and the
+        # trailing-slash strip, plus the combined form.
+        variants = _password_variants("https://t.me/Foo/")
+        assert "https://t.me/Foo/" in variants  # original first
+        assert "t.me/Foo" in variants            # full strip
+        # ``t.me/Foo/`` is the scheme-stripped form — it should be
+        # tried before the doubly-stripped form to keep the variant
+        # set tight.
+        assert variants.index("t.me/Foo/") < variants.index("t.me/Foo")
+
+    def test_variants_are_unique(self) -> None:
+        # Don't waste an extraction attempt on a duplicate.
+        variants = _password_variants("https://example.com")
+        assert len(variants) == len(set(variants))
+
+    def test_case_insensitive_scheme_match(self) -> None:
+        # Some users type ``HTTPS://`` from older sources; still strip.
+        variants = _password_variants("HTTPS://t.me/Foo")
+        assert "t.me/Foo" in variants
 
 
 class TestLastUsefulLine:
@@ -985,3 +1054,107 @@ class TestExtractArchiveSurfacesPasswordErrors:
             or "wrong password" in msg
             or "encrypted" in msg
         )
+
+
+class TestPasswordVariantRetryIntegration:
+    """End-to-end: build a header-encrypted .7z with a literal
+    password and verify ``extract_archive`` transparently strips
+    ``https://`` from the supplied password.
+
+    This is the integration counterpart to ``TestPasswordVariants``
+    above. The unit-level tests pin the *list* of variants we
+    generate; this one wires up the real extractor to confirm
+    the retry actually fires and produces a usable extraction.
+    """
+
+    @pytest.mark.skipif(
+        shutil.which("7z") is None
+        and shutil.which("7za") is None
+        and shutil.which("7zz") is None,
+        reason="7z binary not available on this host",
+    )
+    def test_https_prefixed_password_is_stripped(self, tmp_path: Path) -> None:
+        import subprocess
+
+        seven = (
+            shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+        )
+        assert seven is not None
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "cookies.txt").write_text("hello\n", encoding="utf-8")
+        archive = tmp_path / "encrypted.7z"
+
+        # The literal password is the un-prefixed form, matching
+        # what a Telegram channel owner actually types when packing
+        # the archive.
+        literal_pw = "t.me/TestChannel"
+        result = subprocess.run(
+            [
+                seven,
+                "a",
+                "-y",
+                f"-p{literal_pw}",
+                "-mhe=on",
+                str(archive),
+                str(src_dir / "cookies.txt"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        # The user supplies the ``https://``-prefixed form they
+        # copied from the Telegram pinned message. The bot must
+        # transparently strip the scheme and successfully extract.
+        out = tmp_path / "out"
+        extract_archive(archive, out, password=f"https://{literal_pw}")
+        extracted = out / "cookies.txt"
+        assert extracted.is_file()
+        assert extracted.read_text(encoding="utf-8") == "hello\n"
+
+    @pytest.mark.skipif(
+        shutil.which("7z") is None
+        and shutil.which("7za") is None
+        and shutil.which("7zz") is None,
+        reason="7z binary not available on this host",
+    )
+    def test_truly_wrong_password_still_fails(self, tmp_path: Path) -> None:
+        # Sanity check: the variant retry must NOT mask a genuinely
+        # wrong password. If neither the original nor any stripped
+        # form works, we still raise ``wrong password`` so the user
+        # gets actionable feedback.
+        import subprocess
+
+        seven = (
+            shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+        )
+        assert seven is not None
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "cookies.txt").write_text("hello\n", encoding="utf-8")
+        archive = tmp_path / "encrypted.7z"
+
+        subprocess.run(
+            [
+                seven,
+                "a",
+                "-y",
+                "-pcorrect-password",
+                "-mhe=on",
+                str(archive),
+                str(src_dir / "cookies.txt"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        # Wrong password with no useful variants. Must fail.
+        out = tmp_path / "out"
+        with pytest.raises(ArchiveError) as exc:
+            extract_archive(
+                archive, out, password="https://wrong-channel.example/Foo"
+            )
+        assert "wrong password" in str(exc.value).lower()
