@@ -9,6 +9,7 @@ Supports two on-disk formats commonly found in logs:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List
 
@@ -127,13 +128,21 @@ def _looks_like_cookie_path(path: Path) -> bool:
 
 
 def iter_cookie_files(root: Path) -> Iterator[Path]:
+    """Walk directory tree efficiently without timeout limits."""
     if root.is_file():
         if _looks_like_cookie_path(root):
             yield root
         return
-    for path in root.rglob("*"):
-        if path.is_file() and _looks_like_cookie_path(path):
-            yield path
+    
+    # Use os.walk for faster traversal than rglob
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        # Skip hidden directories to speed up scanning
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        
+        for filename in filenames:
+            filepath = Path(dirpath) / filename
+            if _looks_like_cookie_path(filepath):
+                yield filepath
 
 
 def collect_cookies(root: Path) -> Iterator[Dict]:
