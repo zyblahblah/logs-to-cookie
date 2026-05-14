@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Iterable, Iterator, Tuple
@@ -92,13 +93,21 @@ def is_password_file(path: Path) -> bool:
 
 
 def iter_password_files(root: Path) -> Iterator[Path]:
+    """Walk directory tree efficiently without timeout limits."""
     if root.is_file():
         if is_password_file(root):
             yield root
         return
-    for path in root.rglob("*"):
-        if path.is_file() and is_password_file(path):
-            yield path
+    
+    # Use os.walk for faster traversal than rglob
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        # Skip hidden directories to speed up scanning
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        
+        for filename in filenames:
+            filepath = Path(dirpath) / filename
+            if is_password_file(filepath):
+                yield filepath
 
 
 def collect_credentials(root: Path) -> Iterator[Tuple[str, str, str, Path]]:
