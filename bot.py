@@ -107,24 +107,24 @@ EDIT_MIN_INTERVAL = float(os.getenv("EDIT_MIN_INTERVAL", "1.2"))
 # We override the per-request defaults via the Application builder so
 # every bot call benefits, and additionally wrap ``send_document`` in
 # a bounded retry loop — see ``_send_zip_with_retry`` below.
-UPLOAD_READ_TIMEOUT = float(os.getenv("UPLOAD_READ_TIMEOUT", "60"))
-UPLOAD_WRITE_TIMEOUT = float(os.getenv("UPLOAD_WRITE_TIMEOUT", "300"))
+UPLOAD_READ_TIMEOUT = float(os.getenv("UPLOAD_READ_TIMEOUT", "90"))
+UPLOAD_WRITE_TIMEOUT = float(os.getenv("UPLOAD_WRITE_TIMEOUT", "460"))
 UPLOAD_CONNECT_TIMEOUT = float(os.getenv("UPLOAD_CONNECT_TIMEOUT", "30"))
 # Maximum number of times we retry a transient upload failure (TimedOut,
 # NetworkError, RetryAfter). Counted across the whole send — the bot
 # always surfaces a clear error after this many attempts so the user
 # is never left staring at a stale "Uploading result..." message.
-UPLOAD_MAX_ATTEMPTS = int(os.getenv("UPLOAD_MAX_ATTEMPTS", "4"))
+UPLOAD_MAX_ATTEMPTS = int(os.getenv("UPLOAD_MAX_ATTEMPTS", "10"))
 # Hard ceiling on a single send attempt. Even with all timeouts set
 # correctly, ``asyncio.wait_for`` guarantees the coroutine returns
 # within this many seconds no matter what HTTPX / Telegram do.
 UPLOAD_ATTEMPT_DEADLINE = float(
-    os.getenv("UPLOAD_ATTEMPT_DEADLINE", "360")
+    os.getenv("UPLOAD_ATTEMPT_DEADLINE", "934922")
 )
 # Cap on the ``retry_after`` value we'll honour from Telegram. If
 # Telegram asks us to wait 30 minutes we'd rather tell the user.
 UPLOAD_MAX_RETRY_AFTER = float(
-    os.getenv("UPLOAD_MAX_RETRY_AFTER", "120")
+    os.getenv("UPLOAD_MAX_RETRY_AFTER", "150")
 )
 
 
