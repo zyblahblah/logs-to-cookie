@@ -127,7 +127,14 @@ def test_retries_then_succeeds_on_timed_out(bot_module, tmp_path: Path) -> None:
 def test_raises_after_exhausting_retries(bot_module, tmp_path: Path) -> None:
     zip_path = tmp_path / "result.zip"
     zip_path.write_bytes(b"PK\x03\x04dummy")
-    fake = _FakeBot([TimedOut("t1"), TimedOut("t2"), TimedOut("t3"), TimedOut("t4")])
+    # Feed UPLOAD_MAX_ATTEMPTS distinct failures so the loop actually
+    # exhausts its budget. Hard-coding 4 here used to silently pass
+    # while UPLOAD_MAX_ATTEMPTS=4; once operators bumped the budget
+    # the test stopped firing the final attempts.
+    errors = [
+        TimedOut(f"t{i + 1}") for i in range(bot_module.UPLOAD_MAX_ATTEMPTS)
+    ]
+    fake = _FakeBot(errors)
     with _patch_sleep():
         with pytest.raises(bot_module._UploadFailed) as ei:
             _run(
