@@ -39,6 +39,7 @@ fire off another job back-to-back without losing access to ``/start``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -93,6 +94,21 @@ MAX_DOWNLOAD_BYTES = int(
 MAX_LINKS_PER_JOB = int(os.getenv("MAX_LINKS_PER_JOB", "10"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json")).expanduser()
+
+# Root directory for per-job temp work. Defaults to the OS temp dir
+# (typically ``/tmp``) which on Railway is **ephemeral** — a container
+# restart / redeploy wipes it, and every in-flight job loses its
+# partial download. Operators can point this at a Railway Volume (e.g.
+# ``LOGS_TO_COOKIE_WORKDIR=/data``) so the workdir survives restarts;
+# combined with the resumable download in pipeline/download.py, a
+# user who re-submits the same URL after a restart picks up from where
+# they left off instead of starting at zero. Unset by default to
+# preserve the historical behaviour for hosts where ``/tmp`` is fine.
+WORKDIR_ROOT: Optional[Path] = (
+    Path(os.getenv("LOGS_TO_COOKIE_WORKDIR")).expanduser()
+    if os.getenv("LOGS_TO_COOKIE_WORKDIR")
+    else None
+)
 
 # Status edits go through Telegram's ``editMessageText`` API which is
 # rate-limited at roughly 1 edit / second per chat. We coalesce our
@@ -238,6 +254,65 @@ def _progress_bar(read: int, total: Optional[int], width: int = 14) -> str:
         pct = f"{ratio * 100:.1f}%"
         return f"{bar} {pct}\n📡 {_human_bytes(read)} / {_human_bytes(total)}"
     return f"{'░' * width}\n📡 {_human_bytes(read)} so far"
+
+
+def _job_workdir_name(
+    *,
+    user_id: int,
+    urls: Sequence[str],
+    passwords: Sequence[Optional[str]],
+    keywords: Sequence[str],
+) -> str:
+    """Deterministic directory name for one job's working files.
+
+    Hashes the inputs that uniquely identify a job (the requesting
+    user, the URLs in submission order, per-URL passwords, and the
+    keyword filter) so that re-submitting the same job lands in the
+    same workdir. Combined with the resumable download in
+    ``pipeline/download.py`` this lets a user pick up an in-flight
+    job after a Railway redeploy by simply re-issuing ``/start`` with
+    the same URLs — the bot finds the partial file on disk and
+    resumes the download from where it left off.
+    """
+    h = hashlib.sha256()
+    h.update(f"u={int(user_id or 0)}\n".encode())
+    for u in urls:
+        h.update(f"url={u}\n".encode())
+    for p in passwords:
+        h.update(f"pw={p or ''}\n".encode())
+    for k in keywords:
+        h.update(f"kw={k}\n".encode())
+    return f"job-{h.hexdigest()[:16]}"
+
+
+def _resolve_workdir(
+    *,
+    user_id: int,
+    urls: Sequence[str],
+    passwords: Sequence[Optional[str]],
+    keywords: Sequence[str],
+) -> Path:
+    """Pick the per-job workdir, honouring ``LOGS_TO_COOKIE_WORKDIR``.
+
+    * Unset (default): mint a fresh ephemeral directory under the OS
+      tempdir via ``mkdtemp``. Historical behaviour; loses partial
+      downloads on container restart.
+    * Set (e.g. ``LOGS_TO_COOKIE_WORKDIR=/data``): build a
+      **deterministic** path under ``<root>/jobs/<hash>`` so a
+      re-submission of the same job picks up the existing partial
+      download. The directory is created if missing.
+    """
+    if WORKDIR_ROOT is None:
+        return Path(tempfile.mkdtemp(prefix="logs2cookie-"))
+    name = _job_workdir_name(
+        user_id=user_id,
+        urls=urls,
+        passwords=passwords,
+        keywords=keywords,
+    )
+    path = WORKDIR_ROOT / "jobs" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _split_keywords(text: str) -> list[str]:
@@ -841,6 +916,7 @@ async def _submit_job(
             urls=urls,
             passwords=passwords,
             keywords=keywords,
+            user_id=user_id,
         )
 
     job = await QUEUE.submit(
@@ -898,6 +974,7 @@ async def _run_pipeline_for_job(
     urls: Sequence[str],
     passwords: Sequence[Optional[str]],
     keywords: Sequence[str],
+    user_id: int = 0,
 ) -> None:
     started = time.time()
     loop = asyncio.get_event_loop()
@@ -1042,7 +1119,12 @@ async def _run_pipeline_for_job(
             # matches the wall-clock at job completion.
             raise
 
-    workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
+    workdir = _resolve_workdir(
+        user_id=user_id,
+        urls=urls,
+        passwords=passwords,
+        keywords=keywords,
+    )
     # Keep the heartbeat alive for the entire job (pipeline + upload)
     # — the upload phase can also block for many seconds while
     # ``send_document`` streams the result to Telegram, and the user

@@ -170,6 +170,9 @@ See [`.env.example`](.env.example) for the full list:
 - `MAX_LINKS_PER_JOB` *(default 10)* — caps how many URLs a single `/start` can pull.
 - `MAX_CONCURRENT_JOBS` *(default 1)* — number of jobs the queue will run in parallel across all users.
 - `STATE_PATH` *(default `state.json`)* — JSON file the bot uses to persist VIPs + redemption keys.
+- `LOGS_TO_COOKIE_WORKDIR` *(default unset)* — root directory for per-job temp work (downloads, extractions, intermediate cookie files). When unset the bot uses the OS tempdir (e.g. `/tmp`) which on Railway is **ephemeral**: a container restart wipes any in-flight 30 GB download and the user starts over from byte 0. To survive restarts, mount a Railway Volume at e.g. `/data` and set `LOGS_TO_COOKIE_WORKDIR=/data`. The bot then derives a deterministic per-job path (`<root>/jobs/<hash>`) so re-submitting the same URLs after a restart resumes from the partial file via HTTP `Range:` requests instead of starting over.
+- `DOWNLOAD_MAX_ATTEMPTS` *(default 10)* — number of reconnects the resumable download retries on a mid-stream failure (`IncompleteRead` / `ChunkedEncodingError` / connection drop) before giving up.
+- `DOWNLOAD_RETRY_BASE_DELAY` *(default 2.0)* and `DOWNLOAD_RETRY_BACKOFF_CAP` *(default 60.0)* — exponential backoff between reconnects: real delay = `min(cap, base * 2 ** (attempt - 1))`.
 
 ## How it works
 
