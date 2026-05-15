@@ -24,8 +24,9 @@ import logging
 import os
 import re
 import threading
+import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -75,6 +76,14 @@ _TEXT_PROBE_BYTES: int = 4096
 # (parsing big text files) so a small thread pool already saturates
 # typical disks; bumping it higher mostly costs RAM.
 DEFAULT_PARSE_WORKERS = max(2, min(8, (os.cpu_count() or 2)))
+
+# Conversion progress is emitted at most once every this many seconds
+# so the bot's status message is updated regularly without flooding
+# the Telegram edit queue. Without these periodic emits, the
+# ``🔄 Converting...`` line sits unchanged for the entire conversion
+# phase — which on a 300k-cookie-set job can be many minutes — and
+# the chat looks frozen.
+CONVERT_PROGRESS_INTERVAL = 2.0
 
 # How many URLs to download + extract in parallel for the multi-link
 # flow. Defaults to 6 — most users paste 2-5 links and a moderate
@@ -183,10 +192,20 @@ def _find_cookie_files(root: Path) -> List[Path]:
         if not p.is_file() or p in seen:
             continue
         lname = p.name.lower()
-        # 1) Filename hint.
+        # 1) Filename hint. Chrome's own profile snapshot file is
+        #    literally named ``Cookies`` (no extension) and is a
+        #    SQLite database; it matches the ``cookies`` substring
+        #    here but is guaranteed to yield 0 rows when handed to
+        #    the Netscape parser. Filter binary files out so the
+        #    "X cookie set(s)" status the bot shows reflects files
+        #    that have any chance of producing cookies — not raw
+        #    SQLite blobs / journals / other Chrome internals.
         if any(h in lname for h in COOKIE_FILENAME_HINTS):
-            out.append(p)
-            seen.add(p)
+            if _looks_like_text(p):
+                out.append(p)
+                seen.add(p)
+            else:
+                seen.add(p)
             continue
         # 2) Parent path hint: file lives under a Cookies-like dir.
         try:
@@ -284,11 +303,18 @@ def _process_one_url(
     keywords: Optional[Sequence[str]],
     max_bytes: Optional[int],
     on_progress: Optional[ProgressCallback],
+    on_extracting: Optional[Callable[[], None]] = None,
 ) -> _UrlOutcome:
     """Download one URL, extract it (if archive), and locate cookie sources.
 
     The actual cookie parsing is done by the caller so we can renumber
     output files globally across all URLs in the multi-link flow.
+
+    ``on_extracting`` is invoked (best-effort) right after the
+    download finishes and before extraction begins so the caller can
+    flip the visible status line from ``⏳ Downloading…`` to
+    ``📂 Extracting…``. Without it the chat sits on the download
+    line for the entire (potentially multi-minute) extract phase.
     """
     outcome = _UrlOutcome(url=url)
     try:
@@ -305,6 +331,11 @@ def _process_one_url(
 
         kind = detect_archive_kind(download_path)
         if kind is not None:
+            if on_extracting is not None:
+                try:
+                    on_extracting()
+                except Exception:  # noqa: BLE001
+                    log.exception("on_extracting callback raised")
             extracted = url_dir / "extracted"
             extract_archive(download_path, extracted, password=password)
             outcome.extracted_root = extracted
@@ -457,6 +488,34 @@ def run_pipeline_multi(
     else:
         status(f"⏳ Downloading... ({n_urls} links in parallel)")
 
+    # Once all download bytes are in, the worker switches from
+    # "downloading" to "extracting" silently — multi-GB archives can
+    # spend a long time in the extractor (especially when 7z falls
+    # back to a per-entry-encrypted RAR) with nothing on the chat
+    # to show that anything is still moving. Emit a single
+    # ``📂 Extracting...`` line the first time we observe every
+    # active URL has reported its final progress emit.
+    extracting_emitted = threading.Event()
+
+    def _maybe_emit_extracting() -> None:
+        if extracting_emitted.is_set():
+            return
+        with progress_lock:
+            # Only emit when every URL has reached its known total
+            # — i.e. the final progress emit has fired for each one.
+            if not all(
+                t is not None and per_url_bytes[i] >= (t or 0)
+                for i, t in enumerate(per_url_total)
+            ):
+                return
+        if extracting_emitted.is_set():
+            return
+        extracting_emitted.set()
+        if n_urls == 1:
+            status("📂 Extracting...")
+        else:
+            status(f"📂 Extracting... ({n_urls} link(s))")
+
     outcomes: List[_UrlOutcome] = [None] * n_urls  # type: ignore[list-item]
     workers = min(max(1, int(download_workers)), n_urls)
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -470,6 +529,7 @@ def run_pipeline_multi(
                 keywords=keywords,
                 max_bytes=max_bytes,
                 on_progress=_make_per_url_progress(i),
+                on_extracting=_maybe_emit_extracting,
             )
             for i, u in enumerate(urls)
         ]
@@ -530,14 +590,18 @@ def run_pipeline_multi(
     # ------------------------------------------------------------------
     # 3. Convert each cookie set in parallel. Files are numbered in
     #    the order the work items were collected so the on-disk layout
-    #    is deterministic.
+    #    is deterministic. We collect the results in completion order
+    #    (``as_completed``) so we can report periodic progress to the
+    #    bot — without it the ``🔄 Converting…`` status sits
+    #    unchanged for the entire conversion phase, which on a 300k
+    #    cookie-set job looks indistinguishable from a hung process.
     # ------------------------------------------------------------------
     cookie_files: List[Path] = []
     cookie_count = 0
     if work_items:
         per_set_results: List[Tuple[Path, int]] = [None] * len(work_items)  # type: ignore[list-item]
         with ThreadPoolExecutor(max_workers=max(1, parse_workers)) as pool:
-            futures = []
+            future_to_slot: dict = {}
             for set_idx, (url_idx, outcome, src) in enumerate(work_items, start=1):
                 if src is not None:
                     label = _label_for(src, outcome.extracted_root or src.parent)
@@ -551,25 +615,39 @@ def run_pipeline_multi(
                 if src is None:
                     # Plain rows we already parsed in the worker thread.
                     rows = outcome.plain_rows
-                    futures.append(
-                        (
-                            set_idx - 1,
-                            out_path,
-                            pool.submit(write_netscape_file, out_path, rows),
-                        )
-                    )
+                    fut = pool.submit(write_netscape_file, out_path, rows)
                 else:
-                    futures.append(
-                        (
-                            set_idx - 1,
-                            out_path,
-                            pool.submit(_extract_set, src, out_path, keywords),
-                        )
-                    )
+                    fut = pool.submit(_extract_set, src, out_path, keywords)
+                future_to_slot[fut] = (set_idx - 1, out_path)
 
-            for slot, out_path, fut in futures:
-                n = fut.result()
+            n_done = 0
+            last_emit = time.time()
+            for fut in as_completed(future_to_slot):
+                slot, out_path = future_to_slot[fut]
+                try:
+                    n = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "cookie set #%d failed (%s): %s",
+                        slot + 1,
+                        out_path.name,
+                        exc,
+                    )
+                    n = 0
                 per_set_results[slot] = (out_path, n)
+                n_done += 1
+                now = time.time()
+                if now - last_emit >= CONVERT_PROGRESS_INTERVAL and n_done < n_sets:
+                    last_emit = now
+                    if n_urls == 1:
+                        status(
+                            f"🔄 Converting... ({n_done:,} / {n_sets:,} done)"
+                        )
+                    else:
+                        status(
+                            f"🔄 Converting... ({n_done:,} / {n_sets:,} done "
+                            f"from {n_urls} link(s))"
+                        )
 
         for out_path, n in per_set_results:
             if n:

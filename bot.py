@@ -127,6 +127,19 @@ UPLOAD_MAX_RETRY_AFTER = float(
     os.getenv("UPLOAD_MAX_RETRY_AFTER", "150")
 )
 
+# How often the heartbeat task refreshes the status message with an
+# updated ``⏱️ Elapsed`` timer while the pipeline is in a long phase
+# (extracting a multi-GB archive, converting 300k cookie sets, etc.).
+# Without this, the chat sits on a single status line for many
+# minutes — the elapsed counter is computed at edit time and never
+# advances on its own, so the bot looks frozen. The pipeline itself
+# still emits its own status updates (download progress, conversion
+# progress); the heartbeat is the safety net for any phase that
+# doesn't.
+STATUS_HEARTBEAT_INTERVAL = float(
+    os.getenv("STATUS_HEARTBEAT_INTERVAL", "5")
+)
+
 
 # ---------------------------------------------------------------------------
 # Conversation states
@@ -892,6 +905,11 @@ async def _run_pipeline_for_job(
     last_edit_at = 0.0
     edit_lock = asyncio.Lock()
     pending_text: Optional[str] = None
+    # Heartbeat needs to know the most recent status line (without the
+    # trailing elapsed footer) so it can re-emit it with the live
+    # counter. ``⏳ Starting…`` is what the bot already says before
+    # the first ``_post_status`` from the pipeline fires.
+    last_status_line: str = "⏳ Starting..."
 
     async def _flush_edit() -> None:
         """Apply the most recent pending text, respecting the rate limit.
@@ -936,11 +954,35 @@ async def _run_pipeline_for_job(
         asyncio.run_coroutine_threadsafe(_flush_edit(), loop)
 
     async def _edit_async(text: str) -> None:
+        """Push a literal ``text`` to Telegram, bypassing the heartbeat.
+
+        Caller MUST also update ``last_status_line`` if the new text
+        should survive across the next heartbeat tick — the heartbeat
+        re-emits ``last_status_line`` periodically and would otherwise
+        overwrite this edit with a stale one.
+        """
         nonlocal pending_text
         pending_text = text
         await _flush_edit()
 
+    async def _post_status_async(line: str) -> None:
+        """Update ``last_status_line`` and push the new status synchronously.
+
+        Use this for bot-side status transitions ("Uploading result",
+        "Done", terminal error messages) that need to land before the
+        next phase starts. Updating ``last_status_line`` keeps the
+        heartbeat from re-emitting a stale earlier status on top of
+        this one.
+        """
+        nonlocal last_status_line
+        last_status_line = line
+        elapsed = int(time.time() - started)
+        body = f"{line}\n⏱️ Elapsed: {elapsed}s"
+        await _edit_async(body)
+
     def _post_status(line: str) -> None:
+        nonlocal last_status_line
+        last_status_line = line
         elapsed = int(time.time() - started)
         body = f"{line}\n⏱️ Elapsed: {elapsed}s"
         _schedule_edit(body)
@@ -950,17 +992,62 @@ async def _run_pipeline_for_job(
         total: Optional[int],
         speed: Optional[float] = None,
     ) -> None:
+        nonlocal last_status_line
         elapsed = int(time.time() - started)
         eta = _human_eta(read, total, speed)
-        body = (
+        # Cache a heartbeat-friendly summary of the current download
+        # state so the periodic refresh keeps showing the latest
+        # progress bar with an updated elapsed counter, even when
+        # the download itself stops emitting (e.g. server stall).
+        last_status_line = (
             "⏳ Downloading...\n"
             f"{_progress_bar(read, total)}\n"
-            f"🚀 {_human_speed(speed)}    🎯 ETA {eta}\n"
+            f"🚀 {_human_speed(speed)}    🎯 ETA {eta}"
+        )
+        body = (
+            f"{last_status_line}\n"
             f"⏱️ Elapsed: {elapsed}s"
         )
         _schedule_edit(body)
 
+    async def _heartbeat() -> None:
+        """Re-emit the latest status line with a fresh elapsed counter.
+
+        The pipeline only calls ``status()`` at phase transitions and
+        ``progress()`` while download bytes are flowing. Long phases
+        in between — extracting a 20 GB archive, converting hundreds
+        of thousands of cookie sets, packaging the result — leave
+        the chat sitting on a stale message with a frozen elapsed
+        timer for many minutes. This task wakes up every
+        ``STATUS_HEARTBEAT_INTERVAL`` seconds and queues a fresh edit
+        with the current elapsed time so the user can tell the bot
+        is still alive.
+
+        The pipeline's own phase-transition status updates always
+        win because ``_post_status`` rewrites ``last_status_line``
+        before scheduling the edit — the heartbeat just keeps the
+        timer ticking between those updates.
+        """
+        try:
+            while True:
+                await asyncio.sleep(STATUS_HEARTBEAT_INTERVAL)
+                elapsed = int(time.time() - started)
+                body = f"{last_status_line}\n⏱️ Elapsed: {elapsed}s"
+                # Use _schedule_edit (non-blocking) rather than
+                # _edit_async so a slow Telegram round-trip can't
+                # delay the next heartbeat.
+                _schedule_edit(body)
+        except asyncio.CancelledError:
+            # Final flush so the last "⏱️ Elapsed" the user sees
+            # matches the wall-clock at job completion.
+            raise
+
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
+    # Keep the heartbeat alive for the entire job (pipeline + upload)
+    # — the upload phase can also block for many seconds while
+    # ``send_document`` streams the result to Telegram, and the user
+    # benefits from a ticking ``⏱️ Elapsed`` counter then too.
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         try:
             result = await asyncio.to_thread(
@@ -975,7 +1062,7 @@ async def _run_pipeline_for_job(
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("pipeline failed for %s", urls)
-            await _edit_async(_friendly_pipeline_error(exc))
+            await _post_status_async(_friendly_pipeline_error(exc))
             return
 
         elapsed = int(time.time() - started)
@@ -988,18 +1075,18 @@ async def _run_pipeline_for_job(
             partial = f"\n⚠️ {len(result.errors)} link(s) failed:\n{err_lines}"
 
         if result.cookie_count == 0:
-            await _edit_async(
+            await _post_status_async(
                 "ℹ️ Done — no matching cookies found.\n"
                 f"📡 Read: {_human_bytes(result.bytes_read)} from "
-                f"{len(urls)} link(s)\n"
-                f"⏱️ Elapsed: {elapsed}s" + partial
+                f"{len(urls)} link(s)"
+                + partial
             )
             return
 
         zip_size = result.zip_path.stat().st_size
 
         if zip_size > DOC_UPLOAD_LIMIT:
-            await _edit_async(
+            await _post_status_async(
                 f"❌ Result zip is too large for Telegram "
                 f"({_human_bytes(zip_size)} > "
                 f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
@@ -1010,12 +1097,11 @@ async def _run_pipeline_for_job(
             )
             return
 
-        await _edit_async(
+        await _post_status_async(
             "📤 Uploading result...\n"
             f"📦 {len(result.cookie_files)} cookie set(s) — "
             f"{result.cookie_count} cookies\n"
-            f"📡 zip: {_human_bytes(zip_size)}\n"
-            f"⏱️ Elapsed: {elapsed}s"
+            f"📡 zip: {_human_bytes(zip_size)}"
         )
         try:
             await _send_zip_with_retry(
@@ -1029,7 +1115,7 @@ async def _run_pipeline_for_job(
                     f"from {len(urls)} link(s)\n"
                     f"⏱️ {elapsed}s"
                 ),
-                edit_status=_edit_async,
+                edit_status=_post_status_async,
             )
         except _UploadFailed as exc:
             log.exception(
@@ -1037,25 +1123,29 @@ async def _run_pipeline_for_job(
                 exc.attempts,
                 exc,
             )
-            await _edit_async(
+            await _post_status_async(
                 "❌ Result was built but Telegram refused the upload "
                 f"after {exc.attempts} attempt(s).\n"
                 f"📦 {len(result.cookie_files)} cookie set(s) — "
                 f"{result.cookie_count} cookies\n"
                 f"📡 zip: {_human_bytes(zip_size)}\n"
-                f"⏱️ Elapsed: {elapsed}s\n"
                 f"💬 last error: {exc.last_error}\n"
                 "💡 Tip: try again in a minute, or re-run with a "
                 "stricter keyword filter to shrink the result."
                 + partial
             )
             return
-        await _edit_async(
+        await _post_status_async(
             f"✅ Done! Sent {_human_bytes(zip_size)} "
             f"({len(result.cookie_files)} sets, "
             f"{result.cookie_count} cookies)." + partial
         )
     finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except (asyncio.CancelledError, Exception):
+            pass
         shutil.rmtree(workdir, ignore_errors=True)
 
 

@@ -430,8 +430,8 @@ class TestFindCookieFiles:
         """Chrome's own profile snapshot ``Cookies`` (a SQLite DB)
         often ends up in stealer logs. Feeding it to the Netscape
         parser is a guaranteed 0-row dead end AND wastes IO — so the
-        ``_looks_like_text`` filter rejects SQLite blobs even when
-        they live under a ``Cookies/`` directory."""
+        ``_looks_like_text`` filter rejects SQLite blobs in both the
+        filename-hint and parent-dir-hint discovery rules."""
         cookies_dir = tmp_path / "Cookies"
         cookies_dir.mkdir()
         sqlite_db = cookies_dir / "Cookies"  # Chrome name, no extension
@@ -444,14 +444,37 @@ class TestFindCookieFiles:
         legit.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
 
         found = _find_cookie_files(tmp_path)
-        # SQLite file's name DOES contain "cookies" so it'll still
-        # be picked up by the filename hint (that path is unchanged
-        # — the parser just yields 0 rows for it). What MUST NOT
-        # happen is that the parent-dir promotion path adds it
-        # despite the SQLite signature. We assert that the legit
-        # file is included and that the discovery completes without
-        # raising.
+        # The legit text file must be discovered, and the SQLite blob
+        # must NOT be — even though its filename matches the
+        # ``cookies`` hint. Reading multi-GB SQLite databases through
+        # the Netscape parser only inflates the "X cookie set(s)"
+        # status while producing 0 cookies; skipping them outright
+        # makes the count honest and the conversion phase faster on
+        # raw browser-profile dumps.
         assert legit in found
+        assert sqlite_db not in found
+
+    def test_filename_hint_rejects_binary_blob(self, tmp_path: Path) -> None:
+        """A file outside a ``Cookies/`` directory whose name matches
+        a filename hint (e.g. literally named ``cookies`` with no
+        extension, like Chrome's profile snapshot) must STILL be
+        filtered out when its contents are obviously binary. Without
+        this, raw stealer dumps that include the full Chrome profile
+        directory blow up the candidate count with SQLite blobs that
+        always parse to 0 rows."""
+        sqlite_db = tmp_path / "victim_42" / "cookies"
+        sqlite_db.parent.mkdir(parents=True)
+        sqlite_db.write_bytes(
+            b"SQLite format 3\x00" + b"\x00" * 1024
+        )
+
+        # Same dir but a real Netscape file — still picked up.
+        good = tmp_path / "victim_42" / "passwords-cookies.txt"
+        good.write_text(f"{GOOD_LINE_A}\n", encoding="utf-8")
+
+        found = _find_cookie_files(tmp_path)
+        assert good in found
+        assert sqlite_db not in found
 
     def test_files_with_null_bytes_skipped_under_cookies_dir(
         self, tmp_path: Path
@@ -497,6 +520,141 @@ class TestFindCookieFiles:
 
         found = _find_cookie_files(tmp_path)
         assert found.count(f) == 1
+
+
+class TestConversionStatusUpdates:
+    """``\U0001F504 Converting...`` used to stay frozen for the whole
+    parse phase \u2014 a 300k cookie-set job would sit on the same line
+    for many minutes with no feedback. The conversion loop now emits
+    periodic ``X / N done`` status updates so the user can tell the
+    job is still progressing."""
+
+    def test_conversion_progress_is_emitted(self, tmp_path: Path) -> None:
+        """Build a 12-set fake extracted tree and check that the
+        per-file conversion progress fires multiple status updates
+        between the initial ``\U0001F504 Converting...`` line and the
+        terminal ``\u2699 Processing... packaging\u2026`` one.
+
+        We force ``CONVERT_PROGRESS_INTERVAL`` down to 0 so every
+        completed future emits a fresh status line \u2014 the production
+        default is throttled to one emit / 2 s to keep the Telegram
+        edit queue happy."""
+        import pipeline.pipeline as pp
+
+        # 12 victim dirs, each with a one-cookie Netscape file. That
+        # gives us 12 cookie sets \u2014 enough to observe progress
+        # without the test taking forever.
+        for i in range(12):
+            d = tmp_path / "extracted" / f"victim_{i:02d}" / "Cookies"
+            d.mkdir(parents=True)
+            (d / "Chrome.txt").write_text(
+                f"{GOOD_LINE_A}\n", encoding="utf-8"
+            )
+
+        statuses: list[str] = []
+
+        def _capture(line: str) -> None:
+            statuses.append(line)
+
+        # Force every completed future to emit a progress line.
+        orig_interval = pp.CONVERT_PROGRESS_INTERVAL
+        pp.CONVERT_PROGRESS_INTERVAL = 0.0
+        try:
+            # Re-use the pipeline's _find_cookie_files + low-level
+            # conversion path by running the full pipeline against a
+            # served zip of the tree above.
+            archive_path = tmp_path / "logs.zip"
+            with zipfile.ZipFile(archive_path, "w") as z:
+                for p in (tmp_path / "extracted").rglob("*"):
+                    if p.is_file():
+                        z.write(
+                            p,
+                            arcname=p.relative_to(
+                                tmp_path / "extracted"
+                            ).as_posix(),
+                        )
+            zip_bytes = archive_path.read_bytes()
+
+            work = tmp_path / "work"
+            if (
+                shutil.which("7z") is None
+                and shutil.which("7za") is None
+                and shutil.which("7zz") is None
+            ):
+                pytest.skip("7z binary not available on this host")
+            with serve_zip(zip_bytes) as url:
+                result = run_pipeline(url, work, on_status=_capture)
+        finally:
+            pp.CONVERT_PROGRESS_INTERVAL = orig_interval
+
+        assert result.cookie_count == 12
+
+        # First a single ``\U0001F504 Converting...`` initial line is emitted
+        # with the candidate count, then one or more progress updates,
+        # then the terminal ``\u2699 Processing... packaging\u2026`` line.
+        converting_lines = [
+            s for s in statuses if s.startswith("\U0001F504 Converting...")
+        ]
+        assert len(converting_lines) >= 2, (
+            "expected at least one progress emit after the initial "
+            f"Converting line, got: {converting_lines}"
+        )
+        # Progress lines look like ``\U0001F504 Converting... (X / N done)``.
+        # The final progress line must reference the same total.
+        done_lines = [s for s in converting_lines if "/" in s]
+        assert done_lines, (
+            f"expected at least one 'X / N done' progress line, got: "
+            f"{converting_lines}"
+        )
+
+    def test_extracting_status_emitted_after_download(
+        self, tmp_path: Path
+    ) -> None:
+        """After the download finishes but before extraction returns,
+        a ``\U0001F4C2 Extracting...`` status line must be emitted so the
+        chat doesn't sit on ``\u23F3 Downloading\u2026`` for multi-GB archives."""
+        if (
+            shutil.which("7z") is None
+            and shutil.which("7za") is None
+            and shutil.which("7zz") is None
+        ):
+            pytest.skip("7z binary not available on this host")
+
+        src_root = tmp_path / "src"
+        cookies_dir = src_root / "Victim" / "Cookies"
+        cookies_dir.mkdir(parents=True)
+        (cookies_dir / "Chrome.txt").write_text(
+            f"{GOOD_LINE_A}\n", encoding="utf-8"
+        )
+        archive_path = tmp_path / "logs.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            for p in src_root.rglob("*"):
+                if p.is_file():
+                    z.write(
+                        p,
+                        arcname=p.relative_to(src_root).as_posix(),
+                    )
+        zip_bytes = archive_path.read_bytes()
+
+        statuses: list[str] = []
+
+        def _capture(line: str) -> None:
+            statuses.append(line)
+
+        work = tmp_path / "work"
+        with serve_zip(zip_bytes) as url:
+            run_pipeline(url, work, on_status=_capture)
+
+        # The flow MUST traverse Downloading \u2192 Extracting \u2192 Converting.
+        assert any(
+            s.startswith("\u23F3 Downloading") for s in statuses
+        ), statuses
+        assert any(
+            s.startswith("\U0001F4C2 Extracting") for s in statuses
+        ), statuses
+        assert any(
+            s.startswith("\U0001F504 Converting") for s in statuses
+        ), statuses
 
 
 @pytest.mark.skipif(
