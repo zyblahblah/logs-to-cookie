@@ -677,6 +677,111 @@ class TestAllOnPathDedupe:
         assert len(out) == 3
 
 
+class TestAllOnPathBundledDirs:
+    """``_all_on_path`` looks in well-known bundled-binary directories
+    (``/app/bin``, ``/opt/bin``) directly on disk, not just on the
+    system ``$PATH``. This is what makes the Railway ``railpack.json``
+    deploy work even when the runtime entrypoint doesn't manage to
+    prepend ``/app/bin`` to ``$PATH`` (Procfile vs no-shell, Railpack
+    Procfile reader vs ``deploy.startCommand`` precedence, etc.)."""
+
+    def test_finds_bundled_binary_when_not_on_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bundled_dir = tmp_path / "bundled_bin"
+        bundled_dir.mkdir()
+        bundled = bundled_dir / "7zz"
+        bundled.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bundled.chmod(0o755)
+
+        # Empty PATH — emulating the production failure mode where
+        # the deploy runner forgot to prepend the bundled dir.
+        monkeypatch.setenv("PATH", str(tmp_path / "definitely-empty"))
+        monkeypatch.setattr(
+            "pipeline.archive.WELL_KNOWN_BUNDLED_BIN_DIRS",
+            (str(bundled_dir),),
+        )
+
+        out = _all_on_path(["7zz", "7z", "7za"])
+        assert out == [str(bundled)]
+
+    def test_bundled_binary_is_preferred_over_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A 7zz on PATH (think: apt-installed older 7zip).
+        path_dir = tmp_path / "system_bin"
+        path_dir.mkdir()
+        on_path = path_dir / "7zz"
+        on_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        on_path.chmod(0o755)
+
+        # A second, separately-installed 7zz in the bundled dir
+        # (think: railpack.json's install-7zz step). This is the one
+        # we want the bot to try first because we know exactly what
+        # version it is.
+        bundled_dir = tmp_path / "bundled_bin"
+        bundled_dir.mkdir()
+        bundled = bundled_dir / "7zz"
+        bundled.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bundled.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(path_dir))
+        monkeypatch.setattr(
+            "pipeline.archive.WELL_KNOWN_BUNDLED_BIN_DIRS",
+            (str(bundled_dir),),
+        )
+
+        out = _all_on_path(["7zz"])
+        # Both binaries should be in the list (different physical
+        # paths, neither is a symlink to the other) and the bundled
+        # one must come first.
+        assert len(out) == 2
+        assert out[0] == str(bundled)
+        assert out[1] == str(on_path)
+
+    def test_ignores_bundled_dir_when_binary_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The bundled dir exists but holds no 7zz.
+        bundled_dir = tmp_path / "bundled_bin"
+        bundled_dir.mkdir()
+        path_dir = tmp_path / "system_bin"
+        path_dir.mkdir()
+        on_path = path_dir / "7zz"
+        on_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        on_path.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(path_dir))
+        monkeypatch.setattr(
+            "pipeline.archive.WELL_KNOWN_BUNDLED_BIN_DIRS",
+            (str(bundled_dir),),
+        )
+
+        out = _all_on_path(["7zz"])
+        assert out == [str(on_path)]
+
+    def test_skips_non_executable_files_in_bundled_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A regular non-executable file by the same name in the
+        # bundled dir must NOT be picked up — that would be how a
+        # broken / interrupted install-7zz step looks.
+        bundled_dir = tmp_path / "bundled_bin"
+        bundled_dir.mkdir()
+        broken = bundled_dir / "7zz"
+        broken.write_text("not a real binary", encoding="utf-8")
+        # No chmod +x — file is not executable.
+
+        monkeypatch.setenv("PATH", str(tmp_path / "definitely-empty"))
+        monkeypatch.setattr(
+            "pipeline.archive.WELL_KNOWN_BUNDLED_BIN_DIRS",
+            (str(bundled_dir),),
+        )
+
+        out = _all_on_path(["7zz"])
+        assert out == []
+
+
 class TestWipeDirContents:
     """``_wipe_dir_contents`` is the safety net that prevents the
     silent-success bug where a previous extractor's leftovers (e.g.
